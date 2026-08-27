@@ -2,7 +2,7 @@ import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { clips, jobEvents, jobs } from "@/db/schema";
 import { config } from "./config";
-import { AppError } from "./errors";
+import { AppError, toErrorPayload } from "./errors";
 import { checkBinaries } from "./ffmpeg";
 import { runPipeline } from "./pipeline";
 import {
@@ -10,9 +10,9 @@ import {
   assertStorageWritable,
   ensureStorage,
   jobRoot,
-  pathExists,
   removePath,
 } from "./storage";
+import { checkR2, deleteObjects, objectExists } from "./object-storage";
 import type { ApiJob, JobStatus, Stage } from "./types";
 import { STAGE_LABELS } from "./types";
 
@@ -49,9 +49,11 @@ async function boot(): Promise<void> {
   await ensureStorage();
   await assertStorageWritable();
   await checkBinaries();
+  await checkR2();
 
+  console.log(`[startup] PostgreSQL, FFmpeg, and R2 bucket ${config.r2BucketName} are ready; temp=${config.storageDir}`);
   const interrupted = await db
-    .select({ id: jobs.id, filePath: jobs.filePath, status: jobs.status })
+    .select({ id: jobs.id, sourceType: jobs.sourceType, sourceObjectKey: jobs.sourceObjectKey, status: jobs.status })
     .from(jobs)
     .where(inArray(jobs.status, ["queued", "processing"]))
     .orderBy(asc(jobs.createdAt));
@@ -61,10 +63,10 @@ async function boot(): Promise<void> {
       enqueue(job.id);
       continue;
     }
-    // A job that was mid-flight: it can only resume if the source file survived.
-    const sourceAlive = job.filePath ? await pathExists(job.filePath) : false;
+    // A URL can be downloaded again; an upload can resume from durable R2.
+    const sourceAlive = job.sourceType === "url" || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
     if (sourceAlive) {
-      // Source file survived the restart: requeue honestly.
+      // Durable source survived the restart: requeue from the beginning.
       await db
         .update(jobs)
         .set({
@@ -151,8 +153,27 @@ function pump(): void {
           .where(and(eq(jobs.id, jobId), eq(jobs.status, "queued")));
         await runPipeline(jobId);
       } catch (error) {
-        // runPipeline already persisted the failure; keep the log line for ops.
-        console.error(`[queue] job ${jobId} failed:`, (error as Error).message);
+        // runPipeline persists its own failures. Persist failures that happened
+        // before it started as well (for example, exhausted scratch disk).
+        const payload = toErrorPayload(error);
+        const [current] = await db.select({ status: jobs.status }).from(jobs).where(eq(jobs.id, jobId)).limit(1).catch(() => []);
+        if (current && (current.status === "queued" || current.status === "processing")) {
+          await db.update(jobs).set({
+            status: "failed",
+            stage: "failed",
+            stageDetail: payload.message,
+            error: { kind: payload.kind, message: payload.message, detail: payload.detail, stage: "queue" },
+            finishedAt: new Date(),
+            updatedAt: new Date(),
+          }).where(eq(jobs.id, jobId)).catch(() => undefined);
+          await db.insert(jobEvents).values({
+            jobId,
+            level: "error",
+            stage: "queue",
+            message: payload.message,
+          }).catch(() => undefined);
+        }
+        console.error(`[queue] job ${jobId} failed:`, payload.message);
       } finally {
         state.running.delete(jobId);
         pump();
@@ -185,6 +206,15 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
 
   const ids = removable.map((job) => job.id);
   if (ids.length) {
+    const sources = await db.select({ key: jobs.sourceObjectKey }).from(jobs).where(inArray(jobs.id, ids));
+    const storedClips = await db
+      .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
+      .from(clips)
+      .where(inArray(clips.jobId, ids));
+    await deleteObjects([
+      ...sources.map((item) => item.key),
+      ...storedClips.flatMap((item) => [item.key, item.posterKey]),
+    ]);
     await db.delete(jobs).where(inArray(jobs.id, ids));
   }
 
@@ -212,10 +242,12 @@ export function startCleanupScheduler(): void {
 /* ------------------------------------------------------------------ */
 
 export type CreateJobInput = {
+  id?: string;
   sourceType: "upload" | "url";
   sourceName: string;
   sourceUrl?: string | null;
   filePath?: string | null;
+  sourceObjectKey?: string | null;
   fileSizeBytes?: number | null;
   requestedClips?: number;
   maxClipSec?: number;
@@ -236,7 +268,7 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     Math.max(config.minClipSec, Math.round(input.maxClipSec ?? 45)),
   );
 
-  const id = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await db.insert(jobs).values({
     id,
     status: "queued",
@@ -245,6 +277,7 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     sourceName: input.sourceName.slice(0, 200),
     sourceUrl: input.sourceUrl ?? null,
     filePath: input.filePath ?? null,
+    sourceObjectKey: input.sourceObjectKey ?? null,
     fileSizeBytes: input.fileSizeBytes ?? null,
     requestedClips,
     maxClipSec,
@@ -384,6 +417,14 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
 export async function deleteJob(jobId: string): Promise<void> {
   const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   if (!job) throw new AppError("not_found", `Job ${jobId} not found.`, { status: 404 });
+  const storedClips = await db
+    .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
+    .from(clips)
+    .where(eq(clips.jobId, jobId));
+  await deleteObjects([
+    job.sourceObjectKey,
+    ...storedClips.flatMap((item) => [item.key, item.posterKey]),
+  ]);
   await db.delete(jobs).where(eq(jobs.id, jobId));
   await removePath(jobRoot(jobId));
 }

@@ -1,162 +1,122 @@
-# ClipForge — AI vertical clip generator (Version 1)
+# ClipForge — AI vertical clip generator
 
-Turn one long video into short vertical (9:16) clips with AI-picked moments and burned-in captions.
-Cloud-only: the only thing you need on your OPPO AK1 is a browser.
+ClipForge turns a long video into captioned 9:16 clips. The existing mobile UI, upload/URL ingest, Groq transcription, AI selection, FFmpeg rendering, retries, progress polling, and downloads run in one long-running Next.js application.
 
-**V1 success criterion:** upload one video → transcribe it → AI picks strong moments → FFmpeg cuts
-vertical clips with captions → preview and download each clip.
+## Production architecture
 
----
-
-## 1. Architecture
-
-A single Next.js (App Router) deployment holds the UI, the API and the worker. Job state lives in
-PostgreSQL so progress survives page reloads and server restarts.
-
-```
-Browser (mobile web)                Next.js server (Node runtime)              External
-─────────────────────              ─────────────────────────────              ────────
-page.tsx  ──POST /api/jobs/upload──▶ ingest.ts ──stream to disk──▶ storage.ts
-          ──POST /api/jobs (url) ──▶            └─yt-dlp optional─┘
-          ──GET  /api/jobs/:id ───▶ jobs.ts (queue, 1 worker) ──▶ pipeline.ts
-                                             │
-                                             ├─▶ ffmpeg.ts      probe + extract 16k mono FLAC + render
-                                             ├─▶ transcribe.ts  Groq Whisper (chunked, word timestamps)
-                                             ├─▶ analyze.ts     Groq → OpenRouter fallback, strict JSON
-                                             ├─▶ validate.ts    clamp / snap / de-overlap timestamps
-                                             ├─▶ subtitles.ts   word timings → karaoke ASS
-                                             └─▶ render.ts path crop→9:16→burn captions (one pass)
-                                             │
-                                             └─▶ Postgres (jobs, clips, job_events) + temp disk
+```text
+Browser ──HTTPS──> Render web service (Next.js UI + API + one in-process worker)
+                         ├── PostgreSQL: jobs, progress, transcript, metadata
+                         ├── Cloudflare R2: source videos, clips, poster frames
+                         ├── Groq: Whisper transcription + primary analysis
+                         ├── OpenRouter: optional analysis fallback
+                         └── /tmp/clipforge: active-job scratch files only
+                                      └── FFmpeg/FFprobe installed in Docker
 ```
 
-### Module boundaries (one responsibility each)
+This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can take many minutes and require a stable process, CPU, and temporary disk. Render is configured as a Docker web service. Keep the service at **one instance** in V1 because its queue is in-process; `MAX_CONCURRENT_JOBS=1` is recommended on a small machine.
 
-| File | Responsibility |
-| --- | --- |
-| `src/app/page.tsx` | Mobile-first UI: source picker, options, progress, clip list |
-| `src/app/api/*` | Thin HTTP layer: create/poll/delete jobs, stream clips, cleanup, diagnostics |
-| `src/lib/jobs.ts` | Job manager: queue, concurrency limit, restart recovery, cleanup scheduler |
-| `src/lib/pipeline.ts` | Orchestrates all stages, persists progress + errors |
-| `src/lib/ingest.ts` | Streamed uploads, direct-URL download, source validation |
-| `src/lib/ffmpeg.ts` | Only place that spawns FFmpeg/FFprobe |
-| `src/lib/transcribe.ts` | Audio extraction + Groq Whisper with chunking and overlap merging |
-| `src/lib/analyze.ts` | Prompt building, provider failover, JSON extraction |
-| `src/lib/validate.ts` | Timestamp validation, snapping to speech, overlap removal |
-| `src/lib/subtitles.ts` | Caption grouping and ASS/SRT generation |
-| `src/lib/storage.ts` | Temp dirs, disk-space guard, retention purge |
-| `src/db/schema.ts` | `jobs`, `clips`, `job_events` |
+### Storage lifecycle
 
-### Pipeline stages (persisted, pollable)
+* Browser uploads stream directly into the private R2 bucket; they are not retained on app disk.
+* A worker downloads the source from R2 into its job scratch directory immediately before processing.
+* Direct-URL sources are downloaded to scratch and copied to R2 before processing continues.
+* Each rendered clip and poster is uploaded to R2 immediately, then its local copy is deleted.
+* The entire scratch directory and local source are removed in the pipeline `finally` block on success or failure.
+* The existing retention cleanup deletes expired database rows and their R2 source/clip/poster objects. Set `RETENTION_HOURS` to the desired product retention period.
+* Clip playback/download keeps the existing same-origin API URL. The API streams the private R2 object and supports HTTP Range requests.
 
-`queued → ingesting → probing → extracting_audio → transcribing → analyzing → selecting → rendering → finalizing → done`
+## Local development
 
-Weights drive a 0–100 progress bar; `job_events` keeps the full log so nothing fails silently.
-
----
-
-## 2. API
-
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `POST` | `/api/jobs` | Create a job from a direct media URL |
-| `POST` | `/api/jobs/upload` | Create a job from a raw binary upload body (streams to disk) |
-| `GET` | `/api/jobs` | Recent jobs |
-| `GET` | `/api/jobs/:id` | Full job state: stage, progress, clips, events, transcript preview |
-| `DELETE` | `/api/jobs/:id` | Delete job + clips + temp files immediately |
-| `POST` | `/api/jobs/:id/retry` | Re-run a failed/partial job |
-| `GET` | `/api/clips/:id/file` | Stream a clip (HTTP Range supported, `?download=1` to force download) |
-| `GET` | `/api/diagnostics/render` | Renders a real 4s clip to prove FFmpeg + fonts work on this host |
-| `POST` | `/api/maintenance/cleanup` | Purge expired jobs (also on an in-process timer) |
-| `GET` | `/api/health`, `/api/config` | Health, provider status, limits |
-
-Example:
+Prerequisites: Node.js 22, PostgreSQL, FFmpeg/FFprobe on `PATH`, and an R2 bucket/token.
 
 ```bash
-curl -X POST https://your-host/api/jobs/upload?clips=3 \
-  -H "x-file-name: interview.mp4" \
-  --data-binary @interview.mp4
+cp .env.example .env
+# Fill all required values
+npm ci
+npm run db:migrate
+npm run dev
 ```
 
----
+`npm run build` intentionally works without `DATABASE_URL`; database initialization is lazy at runtime. `npm start` first runs all checked-in SQL migrations and only starts Next.js if migration succeeds.
 
-## 3. Setup
+Useful checks:
 
 ```bash
-cp .env.example .env      # then fill in DATABASE_URL + GROQ_API_KEY
-npm install
-npx drizzle-kit push      # creates jobs / clips / job_events
-npm run build && npm start
+npm run typecheck
+npm run lint
+npm run build
+curl http://localhost:3000/api/health
 ```
 
-FFmpeg is bundled via `ffmpeg-static` / `ffprobe-static`, so **no system FFmpeg install is required**.
-If you prefer a system build, set `FFMPEG_PATH` / `FFPROBE_PATH`.
+The health endpoint tests PostgreSQL, R2 bucket access, FFmpeg/FFprobe, provider configuration, temporary storage, and queue startup. The UI's FFmpeg self-test remains available.
 
-Verify a deployment from your phone: open the app → *Server health & FFmpeg self-test* → **Run FFmpeg
-self-test**. It renders a real 4-second 1080×1920 clip with a burned caption and reports every step.
+## Exact Render deployment
 
----
+### 1. Cloudflare R2
 
-## 4. Deployment (the honest version)
+1. Keep/create the bucket **`my-clips-storage`**.
+2. In Cloudflare, create an R2 API token scoped to that bucket with **Object Read & Write** permission.
+3. Record the Account ID, Access Key ID, and Secret Access Key.
+4. The S3 endpoint is normally `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`. Do not use the public `r2.dev` URL. The bucket can remain private.
 
-Because FFmpeg, local disk and long jobs are involved, **you need a long-running Node server with a
-writable disk** — not a serverless function.
+No R2 CORS rule is required for V1 because browsers communicate with the same-origin API, not R2 directly.
 
-| Option | Works? | Notes |
-| --- | --- | --- |
-| Railway / Render / Fly.io (Node service) | ✅ recommended | ~$5/mo, persistent disk, apt not required (bundled FFmpeg) |
-| Hetzner / DigitalOcean VPS (Node + Postgres) | ✅ cheapest | 1 vCPU / 2GB is enough at `MAX_CONCURRENT_JOBS=1` |
-| Vercel serverless | ❌ for processing | 10–60s limits, ephemeral FS, no long jobs. You *can* host the UI there and point it at a separate worker, but that split is **not built in V1** |
-| Netlify / static-only | ❌ | No Node runtime for FFmpeg |
+### 2. Render PostgreSQL
 
-**Cheap setup that works today:** one Railway/Render Node service + its Postgres add-on. Attach a
-persistent mount and set `STORAGE_DIR` to it — otherwise clips vanish on redeploy (see limits below).
+Create a managed Render PostgreSQL database. Use its **internal** connection URL as `DATABASE_URL` when the app and database are in the same Render region. The included `render.yaml` can create and wire this database automatically.
 
-**Free cron (optional):** point cron-job.org at `POST /api/maintenance/cleanup` every 15 min. The
-in-process scheduler already runs it, so this is belt-and-braces.
+### 3. Render web service
 
----
+1. Push this repository/branch to GitHub.
+2. Render Dashboard → **New → Blueprint** and select the repository (uses `render.yaml`), or create a **Web Service** with runtime **Docker**.
+3. Choose a paid, always-on instance with at least **2 GB RAM** and enough CPU for FFmpeg. Do not configure autoscaling or multiple instances for V1.
+4. Add all secret environment variables listed below. Set `FRONTEND_URL` to the final `https://...onrender.com` URL.
+5. Deploy. Docker installs FFmpeg, Next.js builds, `npm start` runs migrations, then binds Next.js to `0.0.0.0:$PORT`.
+6. Open `/api/health`; confirm database, R2, FFmpeg, providers, and queue report ready.
+7. In the UI, run the FFmpeg self-test, then submit a short real video.
 
-## 5. Known limits in Version 1 (by design, not bugs)
+A Render persistent disk is **not needed**: `/tmp/clipforge` is disposable processing scratch space. Ensure the instance has enough ephemeral disk for one source, extracted audio, and one output clip.
 
-- **Social platform links (YouTube, TikTok, Instagram, Vimeo) are not supported.** They need
-  `yt-dlp`, which is a Python scraping tool that breaks regularly and is not installable on most
-  managed Node hosts. Paste a **direct media URL** (`.mp4`/`.mov`/`.webm`) or upload the file from
-  your phone. `ALLOW_YTDLP=1` enables it *only* on a host where the binary is genuinely installed —
-  the app detects it at runtime and never pretends otherwise.
-- **Center crop only.** No face tracking or subject reframing. A speaker who walks off-centre will
-  drift out of frame.
-- **No accounts, no multi-tenancy.** Anyone with the URL can use the server and see its clips. Do not
-  expose it publicly.
-- **Temp storage only.** Jobs are deleted after `RETENTION_HOURS` (default 6). Without a persistent
-  disk, clips are also lost on redeploy or instance restart. Download clips you want to keep.
-- **Single worker** (`MAX_CONCURRENT_JOBS=1`). A second job waits in the queue; the UI shows "Queued".
-- **Restart semantics.** If the process dies mid-job, startup marks it failed with
-  *"Interrupted by a server restart"* — or re-queues it if the source file is still on disk. It never
-  reports success for work that did not finish.
-- **Groq 25MB transcription cap** is handled by chunking audio (default 600s chunks with 1.5s overlap
-  and de-duplication), so hour-long videos work.
-- **Vertical output is fixed** at 1080×1920 / 30fps / CRF 23 (env-tunable). Sources below ~1080p are
-  upscaled to fill the frame.
+## Environment variables
 
----
+Required on the Render web service (all are server-only; never prefix them with `NEXT_PUBLIC_`):
 
-## 6. Error handling
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Render PostgreSQL internal connection URL |
+| `GROQ_API_KEY` | Groq key for Whisper and primary analysis |
+| `OPENROUTER_API_KEY` | OpenRouter fallback key (may be blank if fallback is intentionally disabled) |
+| `R2_ACCOUNT_ID` | Cloudflare account ID |
+| `R2_ACCESS_KEY_ID` | R2 token access key ID |
+| `R2_SECRET_ACCESS_KEY` | R2 token secret |
+| `R2_BUCKET_NAME` | `my-clips-storage` |
+| `R2_ENDPOINT` | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
+| `FRONTEND_URL` | Public Render application origin, no trailing slash |
 
-Every failure is classified (`kind`), shown in the UI, and stored on the job row:
+Recommended production settings:
 
-| `kind` | Meaning | What the UI says |
-| --- | --- | --- |
-| `missing_api_key` | Provider key absent/rejected | Fix the env var |
-| `unsupported_media` | Corrupt, too short, no audio, dead codec | Re-encode / try another file |
-| `too_large` | Upload, duration or provider size limit | Trim or raise the limit |
-| `download_failed` | URL unreachable, non-media, timeout | Check the link |
-| `transcription_failed` | Groq failed after retries, or no speech | Retry / check audio |
-| `invalid_ai_output` | Unparseable or empty model JSON | Includes the raw response snippet |
-| `rate_limited` | HTTP 429 | Auto-retries with backoff, then falls back to OpenRouter |
-| `ffmpeg_error` | Non-zero exit, timeout, empty output | Last 8 lines of FFmpeg stderr are kept |
-| `disk_full` | Below `MIN_FREE_DISK_MB` | Free space / lower retention |
-| `interrupted` | Server restarted mid-job | Run the job again |
+```env
+STORAGE_DIR=/tmp/clipforge
+MAX_CONCURRENT_JOBS=1
+RETENTION_HOURS=24
+ALLOW_YTDLP=false
+```
 
-Partial success is supported: if clip 2 of 3 fails to render, clips 1 and 3 are still delivered and
-the job ends as `partial` with the per-clip error visible.
+See `.env.example` for every tuning variable. Secrets are only read by server modules and are not returned by `/api/config` or embedded in frontend code.
+
+## Database migrations
+
+SQL migrations live in `drizzle/`. `scripts/migrate.mjs` uses `DATABASE_URL` and records applied filenames in `clipforge_migrations`. Migrations are transactional and idempotent, so every Render start can safely run:
+
+```bash
+npm run db:migrate
+```
+
+For schema development, set `DATABASE_URL` locally and run `npm run db:generate`. There are no hardcoded PostgreSQL hosts, users, passwords, or database names in application/Drizzle configuration.
+
+## Job reliability and errors
+
+Job state and events are persisted in PostgreSQL. At startup, queued jobs are restored. Interrupted URL jobs are downloaded again, and interrupted uploads restart from their durable R2 source. Every pipeline exit cleans scratch files. Failed provider, R2, PostgreSQL, disk, and FFmpeg operations produce explicit job/health diagnostics rather than silent failures.
+
+The V1 queue is intentionally in the web process. Render must remain a single long-running instance. A future multi-instance deployment should move queue claiming to PostgreSQL or a dedicated queue/worker service; that split is not necessary for this reliable V1 architecture.

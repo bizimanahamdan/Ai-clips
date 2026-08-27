@@ -101,7 +101,7 @@ async function callChat(options: {
         Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
         ...(isGroq ? {} : {
-          "HTTP-Referer": process.env.OPENROUTER_SITE_URL?.trim() || "https://clipforge.local",
+          "HTTP-Referer": process.env.OPENROUTER_SITE_URL?.trim() || config.frontendUrl || "https://clipforge.local",
           "X-Title": process.env.OPENROUTER_SITE_NAME?.trim() || "ClipForge",
         }),
       },

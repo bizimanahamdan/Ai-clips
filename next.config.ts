@@ -1,9 +1,6 @@
 import type { NextConfig } from "next";
 
-const nextConfig: NextConfig = {
-  // FFmpeg binary packages must stay outside the bundle: they resolve their own
-  // binary path with __dirname, which bundlers rewrite.
-  serverExternalPackages: ["ffmpeg-static", "ffprobe-static"],
-};
+// V1 deliberately keeps the browser UI and Node API in one long-running app.
+const nextConfig: NextConfig = {};
 
 export default nextConfig;

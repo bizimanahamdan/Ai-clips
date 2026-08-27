@@ -29,8 +29,16 @@ export const config = {
     process.env.STORAGE_DIR && process.env.STORAGE_DIR.trim()
       ? process.env.STORAGE_DIR.trim()
       : path.join(os.tmpdir(), "clipforge"),
-  /** Temporary files are deleted after this many hours. */
-  retentionHours: num("RETENTION_HOURS", 6),
+  /** Database records and R2 objects are deleted after this many hours. */
+  retentionHours: num("RETENTION_HOURS", 24),
+
+  /** Cloudflare R2 (all values remain server-only). */
+  r2AccountId: process.env.R2_ACCOUNT_ID?.trim() || "",
+  r2AccessKeyId: process.env.R2_ACCESS_KEY_ID?.trim() || "",
+  r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY?.trim() || "",
+  r2BucketName: process.env.R2_BUCKET_NAME?.trim() || "",
+  r2Endpoint: process.env.R2_ENDPOINT?.trim().replace(/\/$/, "") || "",
+  frontendUrl: process.env.FRONTEND_URL?.trim().replace(/\/$/, "") || "",
   minFreeDiskMb: num("MIN_FREE_DISK_MB", 1500),
   cleanupIntervalMinutes: num("CLEANUP_INTERVAL_MINUTES", 15),
 

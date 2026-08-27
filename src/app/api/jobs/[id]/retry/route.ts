@@ -1,4 +1,3 @@
-import fsp from "node:fs/promises";
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
@@ -7,6 +6,7 @@ import { AppError, toErrorPayload } from "@/lib/errors";
 import { createJobDir } from "@/lib/storage";
 import { ensureRuntime } from "@/lib/jobs";
 import { config } from "@/lib/config";
+import { deleteObjects, objectExists } from "@/lib/object-storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,18 +21,20 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
     if (job.status === "queued" || job.status === "processing") {
       return NextResponse.json({ jobId: id, alreadyRunning: true });
     }
-    if (job.sourceType === "upload" && job.filePath) {
-      const stat = await fsp.stat(job.filePath).catch(() => null);
-      if (!stat) {
-        throw new AppError(
-          "unsupported_media",
-          "The original upload is no longer on the server. Uploads are temporary after the retention window.",
-          { status: 410 },
-        );
-      }
+    if (job.sourceType === "upload" && (!job.sourceObjectKey || !(await objectExists(job.sourceObjectKey)))) {
+      throw new AppError(
+        "unsupported_media",
+        "The original upload is no longer in Cloudflare R2. Please upload it again.",
+        { status: 410 },
+      );
     }
 
     await createJobDir(id);
+    const oldClips = await db
+      .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
+      .from(clips)
+      .where(eq(clips.jobId, id));
+    await deleteObjects(oldClips.flatMap((clip) => [clip.key, clip.posterKey]));
     await db.delete(clips).where(eq(clips.jobId, id));
     await db
       .update(jobs)

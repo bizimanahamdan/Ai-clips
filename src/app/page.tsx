@@ -83,8 +83,11 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
-    void loadConfig();
-    void loadHistory();
+    const timer = window.setTimeout(() => {
+      void loadConfig();
+      void loadHistory();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [loadConfig, loadHistory]);
 
   const poll = useCallback(async (jobId: string) => {

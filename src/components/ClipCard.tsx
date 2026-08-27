@@ -50,7 +50,6 @@ export function ClipCard({ clip }: { clip: ApiClip }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03]">
       <div className="relative bg-black">
-        {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
         <video
           className="aspect-[9/16] max-h-[62vh] w-full object-contain"
           src={clip.playbackUrl ?? undefined}

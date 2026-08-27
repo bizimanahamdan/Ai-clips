@@ -2,74 +2,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { AppError } from "./errors";
 
-/**
- * Binary resolution.
- *
- * Bundlers rewrite `__dirname`, which breaks ffmpeg-static's own path lookup
- * (it ends up as /ROOT/node_modules/...). So we resolve explicitly:
- *   1. explicit env override (FFMPEG_PATH / FFPROBE_PATH)
- *   2. the npm static binaries inside node_modules, verified on disk
- *   3. whatever is on PATH
- */
-function firstExisting(candidates: string[]): string | null {
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      /* ignore */
-    }
-  }
-  return null;
-}
-
-function whichSync(bin: string): string | null {
-  try {
-    const out = execFileSync("which", [bin], { encoding: "utf8" }).trim();
-    return out && fs.existsSync(out) ? out : null;
-  } catch {
-    return null;
-  }
-}
-
-const binaryCache = new Map<string, string>();
-
+/** Docker installs system binaries; local hosts may override their paths. */
 function resolveBinary(kind: "ffmpeg" | "ffprobe"): string {
-  const cached = binaryCache.get(kind);
-  if (cached) return cached;
-
-  const override = process.env[kind === "ffmpeg" ? "FFMPEG_PATH" : "FFPROBE_PATH"];
-  if (override && fs.existsSync(override)) return override;
-
-  const roots = [process.cwd(), path.join(process.cwd(), ".."), "/app", "/app/server"];
-  const staticCandidates: string[] = [];
-  for (const root of roots) {
-    if (kind === "ffmpeg") {
-      staticCandidates.push(path.join(root, "node_modules", "ffmpeg-static", kind));
-    } else {
-      staticCandidates.push(
-        path.join(root, "node_modules", "ffprobe-static", "bin", process.platform, process.arch, "ffprobe"),
-        path.join(root, "node_modules", "ffprobe-static", "bin", process.platform, "x64", "ffprobe"),
-      );
-    }
-  }
-
-  const resolved = firstExisting(staticCandidates) ?? whichSync(kind);
-  if (!resolved) {
-    throw new AppError(
-      "ffmpeg_error",
-      `Could not find a usable ${kind} binary on this server.`,
-      {
-        detail:
-          "Install it (apt-get install -y ffmpeg) or keep node_modules/ffmpeg-static present, or set FFMPEG_PATH / FFPROBE_PATH.",
-      },
-    );
-  }
-  binaryCache.set(kind, resolved);
-  return resolved;
+  return process.env[kind === "ffmpeg" ? "FFMPEG_PATH" : "FFPROBE_PATH"]?.trim() || kind;
 }
 
 /**
@@ -412,7 +349,6 @@ function fontsDir(): string {
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/dejavu",
     "/usr/share/fonts",
-    path.join(process.cwd(), "assets", "fonts"),
   ];
   for (const dir of candidates) {
     try {
@@ -421,7 +357,7 @@ function fontsDir(): string {
       /* ignore */
     }
   }
-  return process.cwd();
+  return "/usr/share/fonts";
 }
 
 /** Pull a still frame so the UI can show a poster for each clip. */

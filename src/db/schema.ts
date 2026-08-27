@@ -28,7 +28,10 @@ export const jobs = pgTable(
     sourceType: text("source_type").notNull(), // upload | url
     sourceName: text("source_name").notNull(),
     sourceUrl: text("source_url"),
+    /** Local path exists only while a worker is actively processing. */
     filePath: text("file_path"),
+    /** Durable source location in Cloudflare R2. */
+    sourceObjectKey: text("source_object_key"),
     fileSizeBytes: integer("file_size_bytes"),
 
     durationSec: real("duration_sec"),
@@ -83,7 +86,10 @@ export const clips = pgTable(
     startSec: real("start_sec").notNull(),
     endSec: real("end_sec").notNull(),
     durationSec: real("duration_sec"),
+    /** filePath is retained for backward-compatible migration only. */
     filePath: text("file_path"),
+    objectKey: text("object_key"),
+    posterObjectKey: text("poster_object_key"),
     fileName: text("file_name"),
     fileSizeBytes: integer("file_size_bytes"),
     width: integer("width"),

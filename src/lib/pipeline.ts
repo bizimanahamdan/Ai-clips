@@ -10,6 +10,12 @@ import { analyseTranscript } from "./analyze";
 import { extractPoster, mediaDurationSeconds, probeVideo, renderVerticalClip } from "./ffmpeg";
 import { buildAssSubtitles, buildCaptionGroups, subtitleOptionsFor } from "./subtitles";
 import { clipFileName, createJobDir, removePath } from "./storage";
+import {
+  clipObjectKey,
+  downloadObjectToFile,
+  sourceObjectKey,
+  uploadFileToR2,
+} from "./object-storage";
 import { extractAndTranscribe } from "./transcribe";
 import { validateClips } from "./validate";
 import type { Stage, Transcript } from "./types";
@@ -70,7 +76,7 @@ export async function runPipeline(jobId: string): Promise<void> {
     await patchJob(ctx, { workDir: ctx.workDir });
 
     /* 1. Ingest ---------------------------------------------------------- */
-    let sourcePath = job.filePath ?? "";
+    let sourcePath = "";
     if (job.sourceType === "url") {
       if (!job.sourceUrl) throw new AppError("bad_request", "Job has a URL source type but no URL stored.");
       assertDirectMediaUrl(job.sourceUrl);
@@ -89,20 +95,25 @@ export async function runPipeline(jobId: string): Promise<void> {
         },
       });
       sourcePath = downloaded.filePath;
+      const durableKey = job.sourceObjectKey || sourceObjectKey(jobId, path.basename(sourcePath));
+      await setStage(ctx, "ingesting", "Saving source video to Cloudflare R2…", 8);
+      await uploadFileToR2(sourcePath, durableKey, downloaded.contentType || "application/octet-stream");
       await patchJob(ctx, {
         filePath: sourcePath,
+        sourceObjectKey: durableKey,
         fileSizeBytes: downloaded.sizeBytes,
         sourceName: path.basename(sourcePath),
       });
-      await log(ctx, "info", "ingesting", `Downloaded ${downloaded.filePath} (${(downloaded.sizeBytes / (1024 * 1024)).toFixed(1)}MB)`);
+      await log(ctx, "info", "ingesting", `Downloaded and stored source (${(downloaded.sizeBytes / (1024 * 1024)).toFixed(1)}MB)`);
     } else {
-      await setStage(ctx, "ingesting", "Using uploaded file…", 8);
-      if (!sourcePath || !(await fsp.stat(sourcePath).catch(() => null))) {
-        throw new AppError(
-          "unsupported_media",
-          "The uploaded file is no longer on the server disk. Uploads are temporary — please upload again.",
-        );
+      await setStage(ctx, "ingesting", "Restoring uploaded source from Cloudflare R2…", 5);
+      if (!job.sourceObjectKey) {
+        throw new AppError("unsupported_media", "This job has no source video in Cloudflare R2. Please upload it again.");
       }
+      sourcePath = path.join(ctx.workDir, `source${path.extname(job.sourceName) || ".mp4"}`);
+      await downloadObjectToFile(job.sourceObjectKey, sourcePath);
+      await patchJob(ctx, { filePath: sourcePath });
+      await setStage(ctx, "ingesting", "Source ready for processing…", 8);
     }
 
     /* 2. Probe ----------------------------------------------------------- */
@@ -271,13 +282,36 @@ export async function runPipeline(jobId: string): Promise<void> {
           throw new AppError("ffmpeg_error", "Rendered clip is missing or suspiciously small.");
         }
         const outProbe = await probeVideo(outputPath);
-
         const fileName = clipFileName(index, clip.title);
+        const objectKey = clipObjectKey(jobId, fileName);
+        const posterPath = path.join(ctx.workDir, `clip-${index + 1}.jpg`);
+        const posterKey = objectKey.replace(/\.mp4$/, ".jpg");
+
+        await setStage(ctx, "rendering", `Uploading clip ${index + 1}/${validated.length} to Cloudflare R2…`);
+        await uploadFileToR2(outputPath, objectKey, "video/mp4");
+        const hasPoster = await extractPoster({
+          input: outputPath,
+          output: posterPath,
+          atSec: Math.min(2, Math.max(0.1, outProbe.durationSec / 2)),
+          width: 270,
+        });
+        let posterStored = false;
+        if (hasPoster) {
+          try {
+            await uploadFileToR2(posterPath, posterKey, "image/jpeg");
+            posterStored = true;
+          } catch (error) {
+            await log(ctx, "warn", "rendering", `Clip ${index + 1} poster upload failed: ${(error as Error).message}`);
+          }
+        }
+
         await db
           .update(clips)
           .set({
             status: "ready",
-            filePath: outputPath,
+            filePath: null,
+            objectKey,
+            posterObjectKey: posterStored ? posterKey : null,
             fileName,
             fileSizeBytes: outStat.size,
             width: outProbe.width,
@@ -295,6 +329,8 @@ export async function runPipeline(jobId: string): Promise<void> {
         await fsp.rm(outputPath, { force: true });
       } finally {
         if (subtitlePath) await fsp.rm(subtitlePath, { force: true });
+        await fsp.rm(outputPath, { force: true });
+        await fsp.rm(path.join(ctx.workDir, `clip-${index + 1}.jpg`), { force: true });
       }
     }
 
@@ -306,18 +342,6 @@ export async function runPipeline(jobId: string): Promise<void> {
       .select()
       .from(clips)
       .where(and(eq(clips.jobId, jobId), eq(clips.status, "ready")));
-
-    for (const clip of ready) {
-      if (!clip.filePath) continue;
-      const posterPath = clip.filePath.replace(/\.mp4$/, ".jpg");
-      const ok = await extractPoster({
-        input: sourcePath,
-        output: posterPath,
-        atSec: clip.startSec + Math.min(2, (clip.durationSec ?? 5) / 2),
-        width: 270,
-      });
-      if (!ok) await log(ctx, "warn", "finalizing", `Could not create a poster frame for ${clip.fileName}.`);
-    }
 
     const status = readyCount === 0 ? "failed" : failedCount > 0 ? "partial" : "completed";
     if (status === "failed") {
@@ -345,6 +369,12 @@ export async function runPipeline(jobId: string): Promise<void> {
     });
     await log(ctx, "error", "failed", `${payload.message}${payload.detail ? ` — ${payload.detail.slice(0, 800)}` : ""}`);
     throw error;
+  } finally {
+    // Local disk is scratch space only. Durable sources and outputs are in R2.
+    const [latest] = await db.select({ filePath: jobs.filePath }).from(jobs).where(eq(jobs.id, jobId)).limit(1).catch(() => []);
+    if (latest?.filePath) await fsp.rm(latest.filePath, { force: true }).catch(() => undefined);
+    if (ctx.workDir) await removePath(ctx.workDir).catch(() => undefined);
+    await db.update(jobs).set({ filePath: null, workDir: null, updatedAt: new Date() }).where(eq(jobs.id, jobId)).catch(() => undefined);
   }
 }
 
