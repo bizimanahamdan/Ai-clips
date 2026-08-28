@@ -105,6 +105,21 @@ ALLOW_YTDLP=false
 
 See `.env.example` for every tuning variable. Secrets are only read by server modules and are not returned by `/api/config` or embedded in frontend code.
 
+### AI analysis configuration
+
+The analysis model is separate from the Whisper model. `GROQ_TRANSCRIBE_MODEL` controls transcription; `GROQ_TEXT_MODEL` and `OPENROUTER_TEXT_MODEL` control clip selection. The default analysis order is `groq,openrouter`. A provider receives one strict structured-output request and, only when correction is useful, one corrected JSON-mode retry before the next configured provider is used.
+
+```env
+GROQ_TEXT_MODEL=openai/gpt-oss-20b
+OPENROUTER_TEXT_MODEL=google/gemini-2.5-flash
+ANALYSIS_PROVIDERS=groq,openrouter
+ANALYSIS_MAX_RETRIES=1
+ANALYSIS_CANDIDATE_MULTIPLIER=3
+ANALYSIS_TRANSCRIPT_MAX_CHARS=90000
+```
+
+The model selects indexed transcript segments rather than inventing timestamps. Timestamp output remains accepted as a compatibility fallback, including clock strings such as `01:55.5`. The backend validates, ranks, and removes overlap before rendering. Video data is never loaded into the analysis prompt.
+
 ## Database migrations
 
 SQL migrations live in `drizzle/`. `scripts/migrate.mjs` uses `DATABASE_URL` and records applied filenames in `clipforge_migrations`. Migrations are transactional and idempotent, so every Render start can safely run:

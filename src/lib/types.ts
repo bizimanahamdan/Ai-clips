@@ -19,6 +19,9 @@ export type Transcript = {
 export type ClipCandidate = {
   startSec: number;
   endSec: number;
+  /** Present when the AI selected indexed transcript boundaries. */
+  startSegment?: number;
+  endSegment?: number;
   title: string;
   hook: string;
   reason: string;

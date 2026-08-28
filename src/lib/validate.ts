@@ -52,6 +52,33 @@ function endAtSpeechBoundary(start: number, limit: number, words: Word[], prefer
   return (sentenceEnds.at(-1) ?? candidates.at(-1))?.end ?? limit;
 }
 
+/** Align timestamp fallbacks to the transcript boundaries they actually touch. */
+function alignToTranscriptSegments(
+  start: number,
+  end: number,
+  transcript: Transcript,
+  maxDuration: number,
+): { start: number; end: number } {
+  if (!transcript.segments.length) return { start, end };
+  const first = transcript.segments.find((segment) => segment.end > start);
+  let last: Transcript["segments"][number] | undefined;
+  for (let index = transcript.segments.length - 1; index >= 0; index -= 1) {
+    if (transcript.segments[index].start < end) {
+      last = transcript.segments[index];
+      break;
+    }
+  }
+  let alignedStart = first && Math.abs(first.start - start) <= 3 ? first.start : start;
+  let alignedEnd = last && Math.abs(last.end - end) <= 3 ? last.end : end;
+  if (alignedEnd - alignedStart > maxDuration) {
+    // Preserve the natural opening; the final cap is snapped to a sentence end.
+    alignedEnd = alignedStart + maxDuration;
+  }
+  alignedStart = Math.max(0, alignedStart);
+  alignedEnd = Math.min(transcript.durationSec, alignedEnd);
+  return { start: alignedStart, end: alignedEnd };
+}
+
 /** Words that overlap the clip window, with timestamps relative to clip start. */
 function wordsInWindow(words: Word[], start: number, end: number): Word[] {
   const inWindow = words.filter((w) => w.end > start + 0.05 && w.start < end - 0.05);
@@ -108,44 +135,24 @@ export function validateClips(options: {
     let end = clamp(rawEnd, 0, options.durationSec);
 
     if (end - start < 2) {
-      // Models sometimes swap or collapse ranges — try to repair before dropping.
+      // Repair an obvious swapped range, but never manufacture unrelated
+      // dialogue merely to make a collapsed AI suggestion long enough.
       if (rawStart > rawEnd && rawStart - rawEnd >= config.minClipSec) {
-        const temp = start;
         start = clamp(rawEnd, 0, options.durationSec);
         end = clamp(rawStart, 0, options.durationSec);
-        void temp;
       } else {
-        end = Math.min(options.durationSec, start + Math.min(maxClipSec, config.minClipSec + 8));
+        issues.push(`Dropped "${cleanText(candidate.title, 40, "clip")}": collapsed time range.`);
+        continue;
       }
     }
 
-    start = snapToSpeech(start, words, "start");
-    end = Math.max(start + Math.min(config.minClipSec, maxClipSec), snapToSpeech(end, words, "end"));
-
-    // If the model chose only the hook, add balanced setup and follow-through.
-    // This turns the selected maximum into a target range rather than merely a
-    // cap, while preserving the original minimum as a last-resort fallback.
+    const selectedSegments = Number.isInteger(candidate.startSegment) && Number.isInteger(candidate.endSegment);
+    if (!selectedSegments) {
+      const aligned = alignToTranscriptSegments(start, end, options.transcript, maxClipSec);
+      start = snapToSpeech(aligned.start, words, "start");
+      end = snapToSpeech(aligned.end, words, "end");
+    }
     let duration = end - start;
-    if (duration < targetMinSec) {
-      let missing = targetMinSec - duration;
-      const before = Math.min(start, missing * 0.4);
-      start -= before;
-      missing -= before;
-      const after = Math.min(options.durationSec - end, missing);
-      end += after;
-      missing -= after;
-      if (missing > 0) start = Math.max(0, start - missing);
-
-      start = snapToSpeech(start, words, "start");
-      end = snapToSpeech(end, words, "end");
-      // Snapping can move inward near sparse speech; fill remaining room at the
-      // opposite edge without ever exceeding the source duration.
-      if (end - start < targetMinSec) {
-        end = Math.min(options.durationSec, start + targetMinSec);
-        if (end - start < targetMinSec) start = Math.max(0, end - targetMinSec);
-      }
-      duration = end - start;
-    }
 
     if (duration > maxClipSec) {
       const limit = start + maxClipSec;
@@ -179,7 +186,13 @@ export function validateClips(options: {
     });
   }
 
-  seen.sort((a, b) => b.score - a.score);
+  // Complete target-range stories outrank short fallback snippets; score then
+  // decides among candidates in the same duration tier.
+  seen.sort((a, b) => {
+    const aPreferred = a.endSec - a.startSec >= targetMinSec ? 1 : 0;
+    const bPreferred = b.endSec - b.startSec >= targetMinSec ? 1 : 0;
+    return aPreferred === bPreferred ? b.score - a.score : bPreferred - aPreferred;
+  });
   const limited = seen.slice(0, Math.max(1, options.requestedClips));
   limited.forEach((clip, index) => {
     clip.index = index;

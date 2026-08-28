@@ -183,7 +183,17 @@ export async function runPipeline(jobId: string): Promise<void> {
       analysisProvider: analysis.provider,
       analysisModel: analysis.model,
     });
-    await log(ctx, "info", "analyzing", `${analysis.provider}/${analysis.model} returned ${analysis.clips.length} candidate(s)`);
+    for (const attempt of analysis.attempts) {
+      if (attempt.outcome === "failed") {
+        await log(ctx, "warn", "analyzing", `${attempt.provider}/${attempt.model} attempt ${attempt.attempt} failed: ${attempt.detail}`);
+      }
+    }
+    await log(
+      ctx,
+      "info",
+      "analyzing",
+      `${analysis.provider}/${analysis.model} succeeded and returned ${analysis.clips.length} candidate(s)`,
+    );
 
     /* 6. Validate -------------------------------------------------------- */
     await setStage(ctx, "selecting", "Validating timestamps…");

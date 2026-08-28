@@ -62,7 +62,8 @@ export const config = {
   /** Clip analysis -------------------------------------------------------- */
   openrouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || "",
   openrouterBaseUrl: str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-  groqTextModel: str("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile"),
+  // Keep model IDs environment-configurable: account/model access can differ.
+  groqTextModel: str("GROQ_TEXT_MODEL", "openai/gpt-oss-20b"),
   openrouterTextModel: str("OPENROUTER_TEXT_MODEL", "google/gemini-2.5-flash"),
   /** groq first (fast), then openrouter as optional fallback. */
   analysisProviders: str("ANALYSIS_PROVIDERS", "groq,openrouter")
@@ -70,7 +71,10 @@ export const config = {
     .map((p) => p.trim().toLowerCase())
     .filter((p) => p === "groq" || p === "openrouter"),
   analysisTimeoutSec: num("ANALYSIS_TIMEOUT_SEC", 180),
-  analysisMaxRetries: num("ANALYSIS_MAX_RETRIES", 2),
+  /** Additional corrected attempts per provider; capped at one in V1. */
+  analysisMaxRetries: num("ANALYSIS_MAX_RETRIES", 1),
+  analysisCandidateMultiplier: num("ANALYSIS_CANDIDATE_MULTIPLIER", 3),
+  analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 90_000),
 
   /** Output --------------------------------------------------------------- */
   targetWidth: num("TARGET_WIDTH", 1080),

@@ -46,7 +46,7 @@ export function describeHttpStatus(status: number, provider: string, body: strin
   if (status === 429) {
     return new AppError(
       "rate_limited",
-      `${provider} rate limit hit (HTTP 429). The job will retry automatically.`,
+      `${provider} rate limit hit (HTTP 429). The job will retry or use a configured fallback automatically.`,
       { detail: snippet, status: 429, retryable: true },
     );
   }
