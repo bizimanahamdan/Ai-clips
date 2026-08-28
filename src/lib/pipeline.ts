@@ -177,6 +177,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       transcript,
       durationSec: probe.durationSec,
       clipCount: job.requestedClips,
+      maxClipSec: job.maxClipSec,
     });
     await patchJob(ctx, {
       analysisProvider: analysis.provider,
@@ -192,6 +193,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       durationSec: probe.durationSec,
       transcript,
       requestedClips: job.requestedClips,
+      maxClipSec: job.maxClipSec,
       rejected,
     });
     for (const issue of rejected) await log(ctx, "warn", "selecting", issue);

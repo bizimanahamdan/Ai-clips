@@ -1,6 +1,7 @@
 import { config, type AnalysisProvider } from "./config";
 import { AppError, describeHttpStatus } from "./errors";
 import type { ClipCandidate, Transcript } from "./types";
+import { preferredClipMin } from "./clip-duration";
 
 export type AnalysisResult = {
   clips: ClipCandidate[];
@@ -35,10 +36,13 @@ export function buildUserPrompt(options: {
   minSec: number;
   maxSec: number;
 }): string {
+  const preferredMin = preferredClipMin(options.maxSec, options.minSec);
   return [
     `Video duration: ${formatClock(options.durationSec)} (${options.durationSec.toFixed(1)}s).`,
     `Wanted: the ${options.clipCount} strongest short-form moments.`,
-    `Each clip must be between ${options.minSec} and ${options.maxSec} seconds.`,
+    `The user selected ${options.maxSec} seconds as the desired maximum clip length.`,
+    `TARGET RANGE: ${preferredMin}-${options.maxSec} seconds per clip. Aim inside this range, preferably near ${options.maxSec} seconds when the idea supports it.`,
+    `${options.minSec} seconds is an emergency fallback minimum, NOT the default or preferred length.`,
     "",
     "Transcript with timestamps:",
     "---------------------------",
@@ -47,9 +51,16 @@ export function buildUserPrompt(options: {
     "",
     "Rules:",
     "- Pick self-contained moments that make sense without the rest of the video.",
+    "- Every clip must communicate a complete idea or mini-story: setup/context, hook or key insight, and a satisfying conclusion/payoff.",
+    preferredMin > options.minSec
+      ? `- Strongly prefer ${preferredMin}-${options.maxSec}s clips. Do not return ${options.minSec}-${preferredMin - 1}s clips merely because they satisfy the technical minimum.`
+      : `- Use the available ${preferredMin}-${options.maxSec}s range and favor the longest complete idea that fits.`,
+    "- Use a shorter fallback only when the transcript genuinely has no meaningful longer boundary; never cut useful context just to make the clip short.",
+    "- Include enough context before the hook to orient a new viewer and enough context after it to finish the thought.",
     "- Prefer strong opinions, surprises, numbers, stories, contrarian takes, emotional peaks.",
     "- startSec and endSec must be inside the video duration and endSec > startSec.",
-    "- Snap startSec to where the sentence actually begins, not mid-sentence.",
+    "- Snap startSec to where the setup or sentence actually begins, not mid-sentence.",
+    "- Snap endSec after the idea resolves; never end mid-sentence or immediately after the hook.",
     "- hook must be a scroll-stopping on-screen line, max 60 characters.",
     "- title must be a short social post title, max 80 characters.",
     "- reason must explain in one sentence why this moment performs.",
@@ -210,6 +221,7 @@ export async function analyseTranscript(options: {
   transcript: Transcript;
   durationSec: number;
   clipCount: number;
+  maxClipSec: number;
   preferredProvider?: AnalysisProvider | null;
 }): Promise<AnalysisResult> {
   const configured: AnalysisProvider[] = [];
@@ -233,12 +245,17 @@ export async function analyseTranscript(options: {
     throw new AppError("invalid_ai_output", "Transcript is empty, so no clip analysis is possible.");
   }
 
+  const selectedMaxSec = Math.min(
+    config.maxClipSec,
+    Math.max(config.minClipSec, options.maxClipSec),
+    options.durationSec,
+  );
   const user = buildUserPrompt({
     transcriptBlock,
     durationSec: options.durationSec,
     clipCount: options.clipCount,
-    minSec: config.minClipSec,
-    maxSec: Math.min(config.maxClipSec, Math.max(config.minClipSec, options.durationSec)),
+    minSec: Math.min(config.minClipSec, selectedMaxSec),
+    maxSec: selectedMaxSec,
   });
 
   const errors: string[] = [];

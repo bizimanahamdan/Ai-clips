@@ -1,6 +1,7 @@
 import { config } from "./config";
 import { AppError } from "./errors";
 import type { ClipCandidate, Transcript, Word } from "./types";
+import { preferredClipMin } from "./clip-duration";
 
 export type ValidatedClip = ClipCandidate & { index: number; words: Word[] };
 
@@ -44,6 +45,13 @@ function snapToSpeech(seconds: number, words: Word[], mode: "start" | "end"): nu
   return Math.max(seconds, last.end);
 }
 
+function endAtSpeechBoundary(start: number, limit: number, words: Word[], preferredMin: number): number {
+  const candidates = words.filter((word) => word.end <= limit && word.end >= start + preferredMin);
+  if (!candidates.length) return limit;
+  const sentenceEnds = candidates.filter((word) => /[.!?][”"']?$/.test(word.word));
+  return (sentenceEnds.at(-1) ?? candidates.at(-1))?.end ?? limit;
+}
+
 /** Words that overlap the clip window, with timestamps relative to clip start. */
 function wordsInWindow(words: Word[], start: number, end: number): Word[] {
   const inWindow = words.filter((w) => w.end > start + 0.05 && w.start < end - 0.05);
@@ -63,16 +71,31 @@ export function validateClips(options: {
   durationSec: number;
   transcript: Transcript;
   requestedClips: number;
+  maxClipSec: number;
   rejected?: string[];
 }): ValidatedClip[] {
   const rejected = options.rejected ?? [];
   const words = options.transcript.words;
-  const maxClipSec = Math.max(config.minClipSec + 1, Math.min(config.maxClipSec, options.durationSec));
+  const maxClipSec = Math.max(
+    Math.min(config.minClipSec, options.durationSec),
+    Math.min(config.maxClipSec, options.maxClipSec, options.durationSec),
+  );
+  const targetMinSec = preferredClipMin(maxClipSec, Math.min(config.minClipSec, maxClipSec));
   const issues: string[] = [];
 
   const seen: ValidatedClip[] = [];
+  // Longer, target-range suggestions get first claim on a transcript window.
+  // Short minimum-length suggestions remain available only as fallbacks.
+  const orderedCandidates = [...options.candidates].sort((a, b) => {
+    const aDuration = Number(a.endSec) - Number(a.startSec);
+    const bDuration = Number(b.endSec) - Number(b.startSec);
+    const aInTarget = Number.isFinite(aDuration) && aDuration >= targetMinSec ? 1 : 0;
+    const bInTarget = Number.isFinite(bDuration) && bDuration >= targetMinSec ? 1 : 0;
+    if (aInTarget !== bInTarget) return bInTarget - aInTarget;
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
 
-  for (const candidate of options.candidates) {
+  for (const candidate of orderedCandidates) {
     const rawStart = Number(candidate.startSec);
     const rawEnd = Number(candidate.endSec);
 
@@ -97,11 +120,36 @@ export function validateClips(options: {
     }
 
     start = snapToSpeech(start, words, "start");
-    end = Math.max(start + config.minClipSec, snapToSpeech(end, words, "end"));
+    end = Math.max(start + Math.min(config.minClipSec, maxClipSec), snapToSpeech(end, words, "end"));
 
+    // If the model chose only the hook, add balanced setup and follow-through.
+    // This turns the selected maximum into a target range rather than merely a
+    // cap, while preserving the original minimum as a last-resort fallback.
     let duration = end - start;
+    if (duration < targetMinSec) {
+      let missing = targetMinSec - duration;
+      const before = Math.min(start, missing * 0.4);
+      start -= before;
+      missing -= before;
+      const after = Math.min(options.durationSec - end, missing);
+      end += after;
+      missing -= after;
+      if (missing > 0) start = Math.max(0, start - missing);
+
+      start = snapToSpeech(start, words, "start");
+      end = snapToSpeech(end, words, "end");
+      // Snapping can move inward near sparse speech; fill remaining room at the
+      // opposite edge without ever exceeding the source duration.
+      if (end - start < targetMinSec) {
+        end = Math.min(options.durationSec, start + targetMinSec);
+        if (end - start < targetMinSec) start = Math.max(0, end - targetMinSec);
+      }
+      duration = end - start;
+    }
+
     if (duration > maxClipSec) {
-      end = start + maxClipSec;
+      const limit = start + maxClipSec;
+      end = endAtSpeechBoundary(start, limit, words, targetMinSec);
       duration = end - start;
     }
     if (duration < Math.min(config.minClipSec, options.durationSec)) {
