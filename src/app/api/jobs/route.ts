@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { AppError, toErrorPayload } from "@/lib/errors";
 import { assertDirectMediaUrl } from "@/lib/ingest";
 import { createJob, ensureRuntime, listJobs } from "@/lib/jobs";
+import { normalizeWhisperLanguage } from "@/lib/transcribe";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
       requestedClips: body.requestedClips,
       maxClipSec: body.maxClipSec,
       subtitlesEnabled: body.subtitlesEnabled,
-      language: body.language?.trim() || null,
+      language: normalizeWhisperLanguage(body.language) ?? null,
     });
 
     return NextResponse.json({ jobId }, { status: 202 });

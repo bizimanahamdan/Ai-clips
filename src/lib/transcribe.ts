@@ -7,6 +7,100 @@ import type { Transcript, TranscriptSegment, Word } from "./types";
 
 const GROQ_LIMIT_BYTES = 24 * 1024 * 1024; // stay under Groq's 25MB cap
 
+/** Languages supported by multilingual Whisper models (ISO-639-1 codes). */
+const WHISPER_LANGUAGE_CODES = new Set([
+  "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
+  "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+  "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "ht", "hu", "hy",
+  "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la", "lb",
+  "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+  "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru",
+  "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+  "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi",
+  "yi", "yo", "zh",
+]);
+
+const LANGUAGE_NAME_TO_CODE: Record<string, string> = {
+  english: "en",
+  french: "fr",
+  spanish: "es",
+  german: "de",
+  italian: "it",
+  portuguese: "pt",
+  dutch: "nl",
+  russian: "ru",
+  ukrainian: "uk",
+  arabic: "ar",
+  swahili: "sw",
+  chinese: "zh",
+  mandarin: "zh",
+  japanese: "ja",
+  korean: "ko",
+  hindi: "hi",
+  turkish: "tr",
+  polish: "pl",
+  romanian: "ro",
+  greek: "el",
+  hebrew: "he",
+  indonesian: "id",
+  malay: "ms",
+  vietnamese: "vi",
+  thai: "th",
+  tamil: "ta",
+  telugu: "te",
+  urdu: "ur",
+  somali: "so",
+  amharic: "am",
+  hausa: "ha",
+  yoruba: "yo",
+  malagasy: "mg",
+};
+
+// Populate the aliases for every supported code using their English display
+// names (for example, Afrikaans → af), while retaining common manual aliases.
+const englishLanguageNames = new Intl.DisplayNames(["en"], { type: "language" });
+for (const code of WHISPER_LANGUAGE_CODES) {
+  const displayName = englishLanguageNames.of(code)?.toLowerCase();
+  if (displayName) LANGUAGE_NAME_TO_CODE[displayName] = code;
+}
+
+const AUTOMATIC_LANGUAGE_VALUES = new Set([
+  "",
+  "auto",
+  "automatic",
+  "automatic detection",
+  "auto detect",
+  "autodetect",
+  "detect",
+  "unknown",
+  "unspecified",
+]);
+
+/**
+ * Convert UI language labels/locales to the ISO code accepted by Groq Whisper.
+ * Automatic detection returns undefined so no language multipart field is sent.
+ */
+export function normalizeWhisperLanguage(value?: string | null): string | undefined {
+  const normalized = (value ?? "").trim().toLowerCase().replace(/_/g, "-");
+  if (AUTOMATIC_LANGUAGE_VALUES.has(normalized)) return undefined;
+
+  const fromName = LANGUAGE_NAME_TO_CODE[normalized];
+  if (fromName) return fromName;
+
+  // Accept an ISO code or locale such as en-US, but send only ISO-639-1.
+  const code = normalized.match(/^([a-z]{2})(?:-[a-z0-9]{2,8})*$/)?.[1];
+  if (code && WHISPER_LANGUAGE_CODES.has(code)) return code;
+
+  const kinyarwandaNote = normalized === "kinyarwanda" || code === "rw"
+    ? " Kinyarwanda (rw) is not supported by the configured Whisper model; use automatic detection instead."
+    : "";
+  throw new AppError(
+    "bad_request",
+    `Unsupported transcription language: "${value}". Choose automatic detection or a Whisper-supported ISO-639-1 language.`,
+    { status: 400, detail: `Examples: English → en, French → fr.${kinyarwandaNote}` },
+  );
+}
+
 type GroqVerboseResponse = {
   text?: string;
   language?: string;
@@ -156,6 +250,10 @@ export async function transcribeAudioFile(options: {
     );
   }
 
+  // Normalize and validate once, before creating any Groq request. Full names
+  // such as "English" must never reach Whisper's language multipart field.
+  const whisperLanguage = normalizeWhisperLanguage(options.language);
+
   const stat = await fsp.stat(options.audioPath);
   const needsChunking = stat.size > GROQ_LIMIT_BYTES;
   const total = needsChunking ? chunkCountFor(options.durationSec) : 1;
@@ -165,7 +263,7 @@ export async function transcribeAudioFile(options: {
   const segments: TranscriptSegment[] = [];
   const words: Word[] = [];
   let text = "";
-  let language: string | null = options.language ?? null;
+  let language: string | null = whisperLanguage ?? null;
 
   const collect = (
     result: { segments: TranscriptSegment[]; words: Word[]; text: string; language: string | null },
@@ -186,7 +284,7 @@ export async function transcribeAudioFile(options: {
       filePath: options.audioPath,
       index: 0,
       total: 1,
-      language: options.language ?? undefined,
+      language: whisperLanguage,
       isLast: true,
       chunkSpan: options.durationSec,
       offsetSec: 0,
@@ -220,7 +318,7 @@ export async function transcribeAudioFile(options: {
           filePath: chunkPath,
           index,
           total,
-          language: options.language ?? undefined,
+          language: whisperLanguage,
           isLast,
           chunkSpan,
           offsetSec: startSec,
@@ -270,6 +368,8 @@ export async function extractAndTranscribe(options: {
   language?: string | null;
   onProgress?: (ratio: number, message: string) => void;
 }): Promise<{ transcript: Transcript; audioPath: string; audioBytes: number }> {
+  // Fail clearly before doing FFmpeg work or making a provider request.
+  const whisperLanguage = normalizeWhisperLanguage(options.language);
   const audioPath = path.join(options.workDir, "source-audio.flac");
   await extractAudio({ input: options.videoPath, output: audioPath });
 
@@ -286,7 +386,7 @@ export async function extractAndTranscribe(options: {
     audioPath,
     workDir: options.workDir,
     durationSec: options.durationSec,
-    language: options.language,
+    language: whisperLanguage,
     onProgress: options.onProgress,
   });
 

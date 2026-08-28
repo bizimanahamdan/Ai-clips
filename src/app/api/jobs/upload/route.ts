@@ -4,6 +4,7 @@ import { AppError, toErrorPayload } from "@/lib/errors";
 import { sanitizeFileName } from "@/lib/ingest";
 import { createJob, ensureRuntime } from "@/lib/jobs";
 import { deleteObject, sourceObjectKey, uploadRequestToR2 } from "@/lib/object-storage";
+import { normalizeWhisperLanguage } from "@/lib/transcribe";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,7 +21,7 @@ export async function POST(request: Request) {
     const requestedClips = Number(url.searchParams.get("clips") ?? "") || undefined;
     const maxClipSec = Number(url.searchParams.get("maxClipSec") ?? "") || undefined;
     const subtitles = url.searchParams.get("subtitles") !== "0";
-    const language = url.searchParams.get("language")?.trim() || null;
+    const language = normalizeWhisperLanguage(url.searchParams.get("language")) ?? null;
 
     const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     uploadedKey = sourceObjectKey(jobId, fileName);
