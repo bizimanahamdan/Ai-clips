@@ -22,6 +22,8 @@ export async function GET() {
     },
     limits: {
       maxUploadMb: config.maxUploadMb,
+      maxUrlSizeMb: config.maxUrlSizeMb,
+      urlDownloadTimeoutSec: config.urlDownloadTimeoutSec,
       maxDurationMinutes: config.maxDurationMinutes,
       maxClipCount: config.maxClipCount,
       defaultClipCount: config.defaultClipCount,
@@ -38,6 +40,7 @@ export async function GET() {
     },
     queue: queueSnapshot(),
     stats,
+    videoSources: ["upload", "direct_url"],
     platformLinksSupported: false,
   });
 }

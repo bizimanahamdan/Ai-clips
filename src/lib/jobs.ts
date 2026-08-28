@@ -64,7 +64,7 @@ async function boot(): Promise<void> {
       continue;
     }
     // A URL can be downloaded again; an upload can resume from durable R2.
-    const sourceAlive = job.sourceType === "url" || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
+    const sourceAlive = job.sourceType === "direct_url" || job.sourceType === "url" || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
     if (sourceAlive) {
       // Durable source survived the restart: requeue from the beginning.
       await db
@@ -149,7 +149,7 @@ function pump(): void {
         await assertDiskSpace();
         await db
           .update(jobs)
-          .set({ status: "processing", stage: "ingesting", updatedAt: new Date() })
+          .set({ status: "processing", stage: "acquiring", updatedAt: new Date() })
           .where(and(eq(jobs.id, jobId), eq(jobs.status, "queued")));
         await runPipeline(jobId);
       } catch (error) {
@@ -243,7 +243,7 @@ export function startCleanupScheduler(): void {
 
 export type CreateJobInput = {
   id?: string;
-  sourceType: "upload" | "url";
+  sourceType: "upload" | "direct_url" | "url";
   sourceName: string;
   sourceUrl?: string | null;
   filePath?: string | null;
@@ -290,8 +290,8 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     jobId: id,
     stage: "queued",
     message:
-      input.sourceType === "url"
-        ? `Job queued for URL: ${input.sourceUrl}`
+      input.sourceType === "direct_url" || input.sourceType === "url"
+        ? `Direct URL job queued: ${input.sourceUrl}`
         : `Job queued for upload: ${input.sourceName} (${((input.fileSizeBytes ?? 0) / (1024 * 1024)).toFixed(1)}MB)`,
   });
   enqueue(id);

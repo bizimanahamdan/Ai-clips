@@ -14,13 +14,13 @@ Browser ──HTTPS──> Render web service (Next.js UI + API + one in-process
                                       └── FFmpeg/FFprobe installed in Docker
 ```
 
-This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can take many minutes and require a stable process, CPU, and temporary disk. Render is configured as a Docker web service. Keep the service at **one instance** in V1 because its queue is in-process; `MAX_CONCURRENT_JOBS=1` is recommended on a small machine.
+This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can take many minutes and require a stable process, CPU, and temporary disk. Render is configured as a Docker web service. Keep the service at **one instance** in V2 because its queue is in-process; `MAX_CONCURRENT_JOBS=1` is recommended on a small machine.
 
 ### Storage lifecycle
 
 * Browser uploads stream directly into the private R2 bucket; they are not retained on app disk.
 * A worker downloads the source from R2 into its job scratch directory immediately before processing.
-* Direct-URL sources are downloaded to scratch and copied to R2 before processing continues.
+* Direct public video URLs are acquired through the source-provider layer directly into the active job's scratch directory. They are not retained in R2 unless `PERSIST_URL_SOURCES=true`.
 * Each rendered clip and poster is uploaded to R2 immediately, then its local copy is deleted.
 * The entire scratch directory and local source are removed in the pipeline `finally` block on success or failure.
 * The existing retention cleanup deletes expired database rows and their R2 source/clip/poster objects. Set `RETENTION_HOURS` to the desired product retention period.
@@ -60,7 +60,7 @@ The health endpoint tests PostgreSQL, R2 bucket access, FFmpeg/FFprobe, provider
 3. Record the Account ID, Access Key ID, and Secret Access Key.
 4. The S3 endpoint is normally `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`. Do not use the public `r2.dev` URL. The bucket can remain private.
 
-No R2 CORS rule is required for V1 because browsers communicate with the same-origin API, not R2 directly.
+No R2 CORS rule is required for V2 because browsers communicate with the same-origin API, not R2 directly.
 
 ### 2. Render PostgreSQL
 
@@ -70,7 +70,7 @@ Create a managed Render PostgreSQL database. Use its **internal** connection URL
 
 1. Push this repository/branch to GitHub.
 2. Render Dashboard → **New → Blueprint** and select the repository (uses `render.yaml`), or create a **Web Service** with runtime **Docker**.
-3. Choose a paid, always-on instance with at least **2 GB RAM** and enough CPU for FFmpeg. Do not configure autoscaling or multiple instances for V1.
+3. Choose a paid, always-on instance with at least **2 GB RAM** and enough CPU for FFmpeg. Do not configure autoscaling or multiple instances for V2.
 4. Add all secret environment variables listed below. Set `FRONTEND_URL` to the final `https://...onrender.com` URL.
 5. Deploy. Docker installs FFmpeg, Next.js builds, `npm start` runs migrations, then binds Next.js to `0.0.0.0:$PORT`.
 6. Open `/api/health`; confirm database, R2, FFmpeg, providers, and queue report ready.
@@ -100,6 +100,8 @@ Recommended production settings:
 STORAGE_DIR=/tmp/clipforge
 MAX_CONCURRENT_JOBS=1
 RETENTION_HOURS=24
+MAX_URL_REDIRECTS=5
+PERSIST_URL_SOURCES=false
 ALLOW_YTDLP=false
 ```
 
@@ -134,4 +136,15 @@ For schema development, set `DATABASE_URL` locally and run `npm run db:generate`
 
 Job state and events are persisted in PostgreSQL. At startup, queued jobs are restored. Interrupted URL jobs are downloaded again, and interrupted uploads restart from their durable R2 source. Every pipeline exit cleans scratch files. Failed provider, R2, PostgreSQL, disk, and FFmpeg operations produce explicit job/health diagnostics rather than silent failures.
 
-The V1 queue is intentionally in the web process. Render must remain a single long-running instance. A future multi-instance deployment should move queue claiming to PostgreSQL or a dedicated queue/worker service; that split is not necessary for this reliable V1 architecture.
+The V2 queue is intentionally in the web process. Render must remain a single long-running instance. A future multi-instance deployment should move queue claiming to PostgreSQL or a dedicated queue/worker service.
+
+## Version 2 direct URL flow
+
+1. The API parses the URL, permits only HTTP/HTTPS without embedded credentials, resolves DNS, and rejects loopback, private, link-local, reserved, and internal hostnames.
+2. Social/webpage providers are rejected clearly; V2 starts with direct public video files.
+3. The worker source registry selects the `direct_url` adapter. Every redirect is handled manually and receives the same SSRF validation.
+4. The response Content-Type and size are checked before streaming. A transform enforces `MAX_URL_SIZE_MB` even when Content-Length is absent, and an abort timer enforces `URL_DOWNLOAD_TIMEOUT_SEC`.
+5. The adapter returns one normalized local file to the unchanged probe → transcription → analysis → validation → render pipeline.
+6. The pipeline `finally` block removes the entire job scratch directory after success or failure. Only final clips/posters use the existing R2 output storage by default.
+
+New source adapters can be added to `src/lib/video-source.ts` without changing the processing pipeline.

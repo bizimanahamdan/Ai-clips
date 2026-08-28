@@ -5,17 +5,13 @@ import { db } from "@/db";
 import { clips, jobEvents, jobs } from "@/db/schema";
 import { config, providersConfigured } from "./config";
 import { AppError, toErrorPayload } from "./errors";
-import { assertDirectMediaUrl, downloadFromUrl, validateSource } from "./ingest";
+import { validateSource } from "./ingest";
 import { analyseTranscript } from "./analyze";
 import { extractPoster, mediaDurationSeconds, probeVideo, renderVerticalClip } from "./ffmpeg";
 import { buildAssSubtitles, buildCaptionGroups, subtitleOptionsFor } from "./subtitles";
 import { clipFileName, createJobDir, removePath } from "./storage";
-import {
-  clipObjectKey,
-  downloadObjectToFile,
-  sourceObjectKey,
-  uploadFileToR2,
-} from "./object-storage";
+import { clipObjectKey, uploadFileToR2 } from "./object-storage";
+import { acquireVideoSource } from "./video-source";
 import { extractAndTranscribe } from "./transcribe";
 import { validateClips } from "./validate";
 import type { Stage, Transcript } from "./types";
@@ -67,7 +63,7 @@ export async function runPipeline(jobId: string): Promise<void> {
   try {
     await patchJob(ctx, {
       status: "processing",
-      stage: "ingesting",
+      stage: "acquiring",
       startedAt: new Date(),
       error: null,
     });
@@ -75,46 +71,40 @@ export async function runPipeline(jobId: string): Promise<void> {
     ctx.workDir = await createJobDir(jobId);
     await patchJob(ctx, { workDir: ctx.workDir });
 
-    /* 1. Ingest ---------------------------------------------------------- */
-    let sourcePath = "";
-    if (job.sourceType === "url") {
-      if (!job.sourceUrl) throw new AppError("bad_request", "Job has a URL source type but no URL stored.");
-      assertDirectMediaUrl(job.sourceUrl);
-      await setStage(ctx, "ingesting", "Downloading video from URL…", 4);
-      const downloaded = await downloadFromUrl({
-        url: job.sourceUrl,
-        jobId,
-        onProgress: (bytes, total) => {
-          const ratio = total ? bytes / total : 0;
-          void setStage(
-            ctx,
-            "ingesting",
-            `Downloading… ${(bytes / (1024 * 1024)).toFixed(0)}MB${total ? ` / ${(total / (1024 * 1024)).toFixed(0)}MB` : ""}`,
-            Math.round(1 + ratio * 8),
-          ).catch(() => undefined);
-        },
-      });
-      sourcePath = downloaded.filePath;
-      const durableKey = job.sourceObjectKey || sourceObjectKey(jobId, path.basename(sourcePath));
-      await setStage(ctx, "ingesting", "Saving source video to Cloudflare R2…", 8);
-      await uploadFileToR2(sourcePath, durableKey, downloaded.contentType || "application/octet-stream");
-      await patchJob(ctx, {
-        filePath: sourcePath,
-        sourceObjectKey: durableKey,
-        fileSizeBytes: downloaded.sizeBytes,
-        sourceName: path.basename(sourcePath),
-      });
-      await log(ctx, "info", "ingesting", `Downloaded and stored source (${(downloaded.sizeBytes / (1024 * 1024)).toFixed(1)}MB)`);
-    } else {
-      await setStage(ctx, "ingesting", "Restoring uploaded source from Cloudflare R2…", 5);
-      if (!job.sourceObjectKey) {
-        throw new AppError("unsupported_media", "This job has no source video in Cloudflare R2. Please upload it again.");
-      }
-      sourcePath = path.join(ctx.workDir, `source${path.extname(job.sourceName) || ".mp4"}`);
-      await downloadObjectToFile(job.sourceObjectKey, sourcePath);
-      await patchJob(ctx, { filePath: sourcePath });
-      await setStage(ctx, "ingesting", "Source ready for processing…", 8);
-    }
+    /* 1. Acquire a normalized local source ----------------------------- */
+    const isDirectUrl = job.sourceType === "direct_url" || job.sourceType === "url";
+    await setStage(
+      ctx,
+      "acquiring",
+      isDirectUrl ? "Starting direct video download…" : "Restoring uploaded video from Cloudflare R2…",
+      2,
+    );
+    let lastAcquisitionUpdate = 0;
+    const acquired = await acquireVideoSource(job, ctx.workDir, (bytes, total) => {
+      const now = Date.now();
+      if (now - lastAcquisitionUpdate < 1000 && (!total || bytes < total)) return;
+      lastAcquisitionUpdate = now;
+      const ratio = total ? Math.min(1, bytes / total) : 0;
+      void setStage(
+        ctx,
+        "acquiring",
+        `Downloading source… ${(bytes / 1024 / 1024).toFixed(1)}MB${total ? ` / ${(total / 1024 / 1024).toFixed(1)}MB` : ""}`,
+        Math.round(2 + ratio * 8),
+      ).catch(() => undefined);
+    });
+    const sourcePath = acquired.localPath;
+    await patchJob(ctx, {
+      filePath: sourcePath,
+      sourceObjectKey: acquired.durableObjectKey,
+      fileSizeBytes: acquired.sizeBytes,
+      sourceName: acquired.fileName,
+    });
+    await log(
+      ctx,
+      "info",
+      "acquiring",
+      `${acquired.provider} source acquired (${(acquired.sizeBytes / 1024 / 1024).toFixed(1)}MB)${acquired.durableObjectKey ? " and retained in R2" : " as temporary scratch only"}`,
+    );
 
     /* 2. Probe ----------------------------------------------------------- */
     await setStage(ctx, "probing", "Reading video metadata…");

@@ -47,8 +47,11 @@ export const config = {
   maxDurationMinutes: num("MAX_DURATION_MINUTES", 120),
   urlDownloadTimeoutSec: num("URL_DOWNLOAD_TIMEOUT_SEC", 600),
   maxUrlSizeMb: num("MAX_URL_SIZE_MB", 800),
-  /** When true, yt-dlp is used if found on PATH (for YouTube-ish links). */
-  allowYtDlp: bool("ALLOW_YTDLP", true),
+  maxUrlRedirects: num("MAX_URL_REDIRECTS", 5),
+  /** Direct URL sources are scratch-only unless explicitly retained in R2. */
+  persistUrlSources: bool("PERSIST_URL_SOURCES", false),
+  /** Reserved for a future provider adapter; direct URLs are V2's safe default. */
+  allowYtDlp: bool("ALLOW_YTDLP", false),
 
   /** Transcription -------------------------------------------------------- */
   groqApiKey: process.env.GROQ_API_KEY?.trim() || "",

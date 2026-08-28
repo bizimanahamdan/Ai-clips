@@ -25,7 +25,7 @@ export const jobs = pgTable(
     stageDetail: text("stage_detail"),
     progress: integer("progress").notNull().default(0),
 
-    sourceType: text("source_type").notNull(), // upload | url
+    sourceType: text("source_type").notNull(), // upload | direct_url (`url` is legacy)
     sourceName: text("source_name").notNull(),
     sourceUrl: text("source_url"),
     /** Local path exists only while a worker is actively processing. */

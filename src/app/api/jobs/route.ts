@@ -3,6 +3,7 @@ import { AppError, toErrorPayload } from "@/lib/errors";
 import { assertDirectMediaUrl } from "@/lib/ingest";
 import { createJob, ensureRuntime, listJobs } from "@/lib/jobs";
 import { normalizeWhisperLanguage } from "@/lib/transcribe";
+import { validatePublicVideoUrl } from "@/lib/url-safety";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,12 +32,13 @@ export async function POST(request: Request) {
     if (url.length > 2048) throw new AppError("bad_request", "That URL is too long.", { status: 400 });
 
     assertDirectMediaUrl(url);
+    const validatedUrl = await validatePublicVideoUrl(url);
 
-    const fileName = decodeURIComponent(url.split("?")[0].split("/").pop() || "video.mp4");
+    const fileName = decodeURIComponent(validatedUrl.pathname.split("/").pop() || "video.mp4");
     const jobId = await createJob({
-      sourceType: "url",
+      sourceType: "direct_url",
       sourceName: fileName,
-      sourceUrl: url,
+      sourceUrl: validatedUrl.href,
       requestedClips: body.requestedClips,
       maxClipSec: body.maxClipSec,
       subtitlesEnabled: body.subtitlesEnabled,

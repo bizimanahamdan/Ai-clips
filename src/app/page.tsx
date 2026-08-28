@@ -17,6 +17,8 @@ type AppConfig = {
   };
   limits: {
     maxUploadMb: number;
+    maxUrlSizeMb: number;
+    urlDownloadTimeoutSec: number;
     maxDurationMinutes: number;
     maxClipCount: number;
     defaultClipCount: number;
@@ -325,7 +327,7 @@ export default function HomePage() {
                 mode === value ? "bg-indigo-500 text-white" : "text-slate-400"
               }`}
             >
-              {value === "upload" ? "Upload file" : "Video URL"}
+              {value === "upload" ? "Upload Video" : "Paste Link"}
             </button>
           ))}
         </div>
@@ -384,13 +386,13 @@ export default function HomePage() {
               className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-sm text-white placeholder:text-slate-500 focus:border-indigo-400 focus:outline-none"
             />
             <p className="text-[11px] leading-relaxed text-slate-500">
-              Must be a <span className="text-slate-300">direct media link</span> (ends in .mp4, .mov, .webm).
-              YouTube/TikTok pages need yt-dlp and are not supported in Version 1.
+              Paste a <span className="text-slate-300">direct public video file</span> such as MP4, MOV, MKV, or WEBM.
+              Maximum {limits?.maxUrlSizeMb ?? "—"}MB and {limits?.maxDurationMinutes ?? "—"} minutes. YouTube, TikTok, and other webpage links are not supported yet.
             </p>
             <button
               type="button"
               onClick={() => void submitUrl()}
-              disabled={busy}
+              disabled={busy || !videoUrl.trim()}
               className="w-full rounded-xl bg-indigo-500 px-4 py-3.5 text-sm font-bold text-white transition active:scale-[0.99] active:bg-indigo-400 disabled:bg-white/5 disabled:text-slate-500"
             >
               Generate clips from URL

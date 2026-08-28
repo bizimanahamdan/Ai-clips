@@ -32,6 +32,7 @@ export type JobStatus = "queued" | "processing" | "completed" | "failed" | "part
 
 export type Stage =
   | "queued"
+  | "acquiring"
   | "ingesting"
   | "probing"
   | "extracting_audio"
@@ -45,6 +46,7 @@ export type Stage =
 
 export const STAGE_LABELS: Record<Stage, string> = {
   queued: "Queued",
+  acquiring: "Acquiring source video",
   ingesting: "Getting the video",
   probing: "Checking the video",
   extracting_audio: "Extracting audio",
@@ -59,6 +61,7 @@ export const STAGE_LABELS: Record<Stage, string> = {
 
 export const STAGE_WEIGHTS: Record<Exclude<Stage, "done" | "failed">, number> = {
   queued: 1,
+  acquiring: 2,
   ingesting: 10,
   probing: 13,
   extracting_audio: 20,
