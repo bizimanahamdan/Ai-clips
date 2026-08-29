@@ -4,6 +4,7 @@ import { db } from "@/db";
 import { mediaAssets } from "@/db/schema";
 import { config } from "@/lib/config";
 import { AppError, toErrorPayload } from "@/lib/errors";
+import { validateAudioUploadMetadata } from "@/lib/audio-upload-validation";
 import { sanitizeFileName } from "@/lib/ingest";
 import { mediaApiAsset, normalizeCategory, normalizeTags } from "@/lib/media-library";
 import { deleteObject, mediaLibraryObjectKey, uploadRequestToR2 } from "@/lib/object-storage";
@@ -12,7 +13,9 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".m4a", ".aac", ".ogg"]);
+function logValidationFailure(fileName: string, mimeType: string, size: string): void {
+  console.warn(`[media-upload] validation failed: filename=${JSON.stringify(fileName)} mime=${JSON.stringify(mimeType || "missing")} size=${size}`);
+}
 
 export async function POST(request: Request) {
   console.info("[media-upload] request started");
@@ -20,16 +23,28 @@ export async function POST(request: Request) {
   try {
     const url = new URL(request.url);
     const category = normalizeCategory(url.searchParams.get("category"));
-    const rawFileName = request.headers.get("x-file-name") || "audio.mp3";
-    const fileName = sanitizeFileName(decodeURIComponent(rawFileName));
-    const extension = path.extname(fileName).toLowerCase();
-    if (!AUDIO_EXTENSIONS.has(extension)) {
-      throw new AppError("unsupported_media", "Library audio must be MP3, WAV, M4A, AAC, or OGG.", { status: 415 });
+    const rawFileName = request.headers.get("x-file-name") || "";
+    let decodedFileName = rawFileName;
+    try {
+      decodedFileName = decodeURIComponent(rawFileName);
+    } catch {
+      // Some Android clients provide an ordinary filename containing a stray
+      // percent sign rather than a URI-encoded header. Sanitization below is
+      // still applied, so use the original value instead of rejecting it.
     }
-    const contentType = request.headers.get("content-type") || "application/octet-stream";
-    if (!contentType.startsWith("audio/") && contentType !== "application/octet-stream") {
-      throw new AppError("unsupported_media", `Unsupported audio Content-Type: ${contentType}.`, { status: 415 });
+    const fileName = sanitizeFileName(decodedFileName || "audio");
+    const validation = validateAudioUploadMetadata(fileName, request.headers.get("content-type"));
+    const extension = validation.extension;
+    const rawContentType = request.headers.get("content-type") || "";
+    const reportedSize = request.headers.get("content-length") || "unknown";
+    if (!validation.accepted) {
+      logValidationFailure(fileName, validation.mimeType, reportedSize);
+      throw new AppError("unsupported_media", "Library audio must be MP3, WAV, M4A, AAC, or OGG.", {
+        detail: `Received ${validation.mimeType || "no MIME type"} with extension ${extension || "missing"}.`,
+        status: 415,
+      });
     }
+    const contentType = rawContentType || "application/octet-stream";
     const tags = normalizeTags(url.searchParams.get("tags"));
     const displayName = (url.searchParams.get("name")?.trim() || path.basename(fileName, extension)).slice(0, 120);
     const id = `asset_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
