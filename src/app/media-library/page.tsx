@@ -14,13 +14,14 @@ type Asset = {
   fileName: string;
   contentType: string;
   fileSizeBytes: number;
-  durationSec: number;
+  durationSec: number | null;
   tags: string[];
   analysis: { estimatedBpm: number | null; vibe: string } | null;
   playbackUrl: string;
 };
 
-function formatDuration(seconds: number) {
+function formatDuration(seconds: number | null) {
+  if (seconds === null || !Number.isFinite(seconds)) return "Duration unknown";
   return `${Math.floor(seconds / 60)}:${Math.round(seconds % 60).toString().padStart(2, "0")}`;
 }
 
@@ -34,6 +35,7 @@ export default function MediaLibraryPage() {
   const [tags, setTags] = useState<string[]>([]);
   const [customTag, setCustomTag] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [uploadPhase, setUploadPhase] = useState<"uploading" | "saving" | null>(null);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -70,29 +72,49 @@ export default function MediaLibraryPage() {
   const upload = useCallback(() => {
     if (!file) { setError("Choose an audio file first."); return; }
     setUploading(true);
+    setUploadPhase("uploading");
     setError(null);
     setProgress(0);
     const finalTags = [...new Set([...tags, ...(customTag.trim() ? [customTag.trim()] : [])])];
     const params = new URLSearchParams({ category, name: name.trim(), tags: finalTags.join(",") });
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/media/upload?${params}`);
+    xhr.timeout = 180_000;
     xhr.setRequestHeader("x-file-name", encodeURIComponent(file.name));
     xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
     xhr.upload.onprogress = (event) => event.lengthComputable && setProgress(Math.round(event.loaded / event.total * 100));
+    xhr.upload.onload = () => {
+      setProgress(100);
+      setUploadPhase("saving");
+    };
     xhr.onload = () => {
       setUploading(false);
+      setUploadPhase(null);
       try {
         const data = JSON.parse(xhr.responseText) as { asset?: Asset; error?: string };
         if (xhr.status < 200 || xhr.status >= 300 || !data.asset) throw new Error(data.error || `Upload failed (${xhr.status})`);
         setFile(null); setName(""); setTags([]); setCustomTag(""); setProgress(0);
         const input = document.getElementById("library-file") as HTMLInputElement | null;
         if (input) input.value = "";
-        void load();
+        setAssets((current) => [data.asset as Asset, ...current.filter((asset) => asset.id !== data.asset?.id)]);
       } catch (err) { setError((err as Error).message); }
     };
-    xhr.onerror = () => { setUploading(false); setError("Upload failed. Check your connection."); };
+    xhr.onerror = () => {
+      setUploading(false);
+      setUploadPhase(null);
+      setError("Upload failed before it could be saved. Check your connection and try again.");
+    };
+    xhr.ontimeout = () => {
+      setUploading(false);
+      setUploadPhase(null);
+      setError("The upload request timed out after 3 minutes. Refresh the library before retrying to avoid a duplicate if the server finished saving it.");
+    };
+    xhr.onabort = () => {
+      setUploading(false);
+      setUploadPhase(null);
+    };
     xhr.send(file);
-  }, [category, customTag, file, load, name, tags]);
+  }, [category, customTag, file, name, tags]);
 
   const remove = useCallback(async (asset: Asset) => {
     if (!window.confirm(`Delete “${asset.name}” permanently?`)) return;
@@ -130,8 +152,17 @@ export default function MediaLibraryPage() {
           {suggestions.map((tag) => <button key={tag} type="button" onClick={() => setTags((current) => current.includes(tag) ? current.filter((item) => item !== tag) : [...current, tag])} className={`rounded-full px-2.5 py-1 text-[10px] ring-1 ${tags.includes(tag) ? "bg-fuchsia-500/20 text-fuchsia-200 ring-fuchsia-400/50" : "bg-white/5 text-slate-400 ring-white/10"}`}>{tag}</button>)}
         </div>
         <input value={customTag} onChange={(event) => setCustomTag(event.target.value)} placeholder="Optional custom tag" className="mt-3 w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-xs text-white outline-none focus:border-indigo-400" />
-        {uploading ? <div className="mt-3 h-1.5 overflow-hidden rounded bg-white/10"><div className="h-full bg-indigo-400 transition-all" style={{ width: `${progress}%` }} /></div> : null}
-        <button disabled={!file || uploading} onClick={upload} className="mt-3 w-full rounded-xl bg-indigo-500 px-4 py-2.5 text-xs font-semibold text-white disabled:opacity-40">{uploading ? `Uploading & analyzing… ${progress}%` : `Add to ${category === "music" ? "Music" : "Sound Effects"}`}</button>
+        {uploading ? (
+          <div className="mt-3">
+            <p className="mb-1.5 text-[10px] text-slate-400">
+              {uploadPhase === "saving" ? "Saving to library…" : `Uploading… ${progress}%`}
+            </p>
+            <div className="h-1.5 overflow-hidden rounded bg-white/10">
+              <div className={`h-full bg-indigo-400 transition-all ${uploadPhase === "saving" ? "animate-pulse" : ""}`} style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+        ) : null}
+        <button disabled={!file || uploading} onClick={upload} className="mt-3 w-full rounded-xl bg-indigo-500 px-4 py-2.5 text-xs font-semibold text-white disabled:opacity-40">{uploading ? (uploadPhase === "saving" ? "Saving to library…" : `Uploading… ${progress}%`) : `Add to ${category === "music" ? "Music" : "Sound Effects"}`}</button>
       </section>
 
       <section className="space-y-3">

@@ -94,7 +94,8 @@ export const mediaAssets = pgTable(
     contentType: text("content_type").notNull(),
     objectKey: text("object_key").notNull().unique(),
     fileSizeBytes: integer("file_size_bytes").notNull(),
-    durationSec: real("duration_sec").notNull(),
+    /** Uploads are saved immediately; duration may be enriched later. */
+    durationSec: real("duration_sec"),
     tags: jsonb("tags").$type<string[]>().notNull().default([]),
     analysis: jsonb("analysis").$type<{
       durationSec: number;

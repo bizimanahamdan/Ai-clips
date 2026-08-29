@@ -159,7 +159,7 @@ Output format is selected before job creation and persisted on the job. Vertical
 
 ## Persistent Media Library
 
-The `/media-library` page stores reusable background music and sound effects in the existing private R2 bucket. Each asset has a permanent database record with its display name, original filename/type, duration, size, tags, object key, and saved music analysis. Upload-time FFprobe/FFmpeg validation and lightweight RMS-energy, peak, approximate-tempo, and vibe analysis run once; clip jobs reuse that metadata and store only asset IDs through `job_media_assets`.
+The `/media-library` page stores reusable background music and sound effects in the existing private R2 bucket. Each asset gets a permanent database record with its display name, original filename/type, size, tags, object key, and optional duration/analysis metadata. Upload requests only stream bytes to R2 and save the database record; they do not download the object again or run blocking FFprobe/FFmpeg work. Duration and analysis may therefore be unknown, while clip jobs reuse the available tags/metadata and store only asset IDs through `job_media_assets`.
 
 Clip creation supports no added audio, manual music selection, or metadata-only auto-match against the AI-selected clip title/hook/reason. Auto-match may use a chosen candidate pool or the full music library. Selected sound effects rotate across clips. The worker downloads only assets actually chosen for rendered clips into the active job scratch directory and removes them in the existing pipeline cleanup.
 

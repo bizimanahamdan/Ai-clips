@@ -1,6 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { jobMediaAssets, mediaAssets } from "@/db/schema";
 import { AppError } from "./errors";
@@ -23,7 +23,7 @@ export type LibraryAsset = {
   contentType: string;
   objectKey: string;
   fileSizeBytes: number;
-  durationSec: number;
+  durationSec: number | null;
   tags: string[];
   analysis: MusicEnergyAnalysis | null;
   createdAt: Date;

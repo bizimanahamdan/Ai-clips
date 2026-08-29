@@ -78,7 +78,8 @@ async function uploadBody(
         Body: body,
         ContentType: contentType,
       },
-      queueSize: 2,
+      // One in-flight multipart chunk keeps memory predictable on a 512 MB host.
+      queueSize: 1,
       partSize: 8 * 1024 * 1024,
       leavePartsOnError: false,
     });

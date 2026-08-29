@@ -47,7 +47,7 @@ type LibraryAsset = {
   category: "music" | "sound_effect";
   name: string;
   fileName: string;
-  durationSec: number;
+  durationSec: number | null;
   tags: string[];
   playbackUrl: string;
 };

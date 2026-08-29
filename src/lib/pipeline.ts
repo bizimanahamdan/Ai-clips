@@ -260,7 +260,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       ? await downloadLibraryAssets(requiredLibraryAssets, ctx.workDir)
       : new Map<string, string>();
     if (requiredLibraryAssets.length) {
-      await log(ctx, "info", "selecting", `Using ${requiredLibraryAssets.length} reusable media library asset(s); saved upload analysis was reused.`);
+      await log(ctx, "info", "selecting", `Using ${requiredLibraryAssets.length} reusable media library asset(s); stored metadata was reused without library-wide analysis.`);
     }
 
     /* 7. Render ---------------------------------------------------------- */
