@@ -188,15 +188,29 @@ export async function runPipeline(jobId: string): Promise<void> {
       throw new AppError(
         "missing_api_key",
         "No AI provider is configured for clip analysis.",
-        { detail: "Set GROQ_API_KEY (primary) and optionally OPENROUTER_API_KEY (fallback)." },
+        { detail: "Set GEMINI_API_KEY for direct Gemini analysis and/or configure OpenRouter or Groq fallback." },
       );
     }
-    await setStage(ctx, "analyzing", "Asking the AI to find the best moments…");
+    await setStage(ctx, "preparing_transcript", "Preparing timestamped transcript parts…", 55);
+    const preferredVibes = mediaMode === "auto"
+      ? [...new Set(libraryAssets.filter((asset) => asset.category === "music").flatMap((asset) => asset.tags))]
+      : [];
     const analysis = await analyseTranscript({
       transcript,
       durationSec: probe.durationSec,
       clipCount: job.requestedClips,
       maxClipSec: job.maxClipSec,
+      preferredVibes,
+      onProgress: async (progress) => {
+        if (progress.phase === "preparing") {
+          await setStage(ctx, "preparing_transcript", progress.message, 55);
+        } else if (progress.phase === "discovery") {
+          const ratio = progress.total ? progress.completed / progress.total : 0;
+          await setStage(ctx, "analyzing", progress.message, Math.round(57 + ratio * 9));
+        } else {
+          await setStage(ctx, "ranking", progress.message, 67);
+        }
+      },
     });
     await patchJob(ctx, {
       analysisProvider: analysis.provider,
@@ -211,7 +225,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       ctx,
       "info",
       "analyzing",
-      `${analysis.provider}/${analysis.model} succeeded and returned ${analysis.clips.length} candidate(s)`,
+      `${analysis.provider}/${analysis.model} completed ${analysis.chunkCount} transcript part(s), discovered ${analysis.discoveredCandidates} candidate(s), and selected ${analysis.clips.length} final clip(s)`,
     );
 
     /* 6. Validate -------------------------------------------------------- */
@@ -266,7 +280,8 @@ export async function runPipeline(jobId: string): Promise<void> {
     /* 7. Render ---------------------------------------------------------- */
     const outputFormat = normalizeOutputFormat(job.outputFormat);
     const dimensions = outputDimensions(outputFormat);
-    await setStage(ctx, "rendering", `Rendering ${validated.length} ${outputFormat} clip(s)…`);
+    const renderEnhancements = [job.subtitlesEnabled !== 0 ? "captions" : "", requiredLibraryAssets.length || backgroundMusic ? "music/effects" : ""].filter(Boolean).join(" and ");
+    await setStage(ctx, "rendering", `Rendering ${validated.length} ${outputFormat} clip(s)${renderEnhancements ? ` with ${renderEnhancements}` : ""}…`);
     const subtitleOpts = subtitleOptionsFor(dimensions.width, dimensions.height);
     let readyCount = 0;
     let failedCount = 0;

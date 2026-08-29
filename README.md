@@ -8,8 +8,9 @@ ClipForge turns a long video into captioned 9:16 clips. The existing mobile UI, 
 Browser ──HTTPS──> Render web service (Next.js UI + API + one in-process worker)
                          ├── PostgreSQL: jobs, progress, transcript, metadata
                          ├── Cloudflare R2: source videos, clips, poster frames
-                         ├── Groq: Whisper transcription + primary analysis
-                         ├── OpenRouter: optional analysis fallback
+                         ├── Gemini: direct long-transcript analysis
+                         ├── OpenRouter: analysis fallback
+                         ├── Groq: Whisper transcription + smaller analysis fallback
                          └── /tmp/clipforge: active-job scratch files only
                                       └── FFmpeg/FFprobe installed in Docker
 ```
@@ -85,8 +86,9 @@ Required on the Render web service (all are server-only; never prefix them with 
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | Render PostgreSQL internal connection URL |
-| `GROQ_API_KEY` | Groq key for Whisper and primary analysis |
-| `OPENROUTER_API_KEY` | OpenRouter fallback key (may be blank if fallback is intentionally disabled) |
+| `GROQ_API_KEY` | Groq key for Whisper transcription and analysis fallback |
+| `GEMINI_API_KEY` | Google AI Studio key for direct Gemini analysis (preferred for long videos) |
+| `OPENROUTER_API_KEY` | OpenRouter analysis fallback key (optional) |
 | `R2_ACCOUNT_ID` | Cloudflare account ID |
 | `R2_ACCESS_KEY_ID` | R2 token access key ID |
 | `R2_SECRET_ACCESS_KEY` | R2 token secret |
@@ -113,18 +115,23 @@ See `.env.example` for every tuning variable. Secrets are only read by server mo
 
 ### AI analysis configuration
 
-The analysis model is separate from the Whisper model. `GROQ_TRANSCRIBE_MODEL` controls transcription; `GROQ_TEXT_MODEL` and `OPENROUTER_TEXT_MODEL` control clip selection. The default analysis order is `groq,openrouter`. A provider receives one strict structured-output request and, only when correction is useful, one corrected JSON-mode retry before the next configured provider is used.
+The analysis model is separate from Whisper transcription. Direct Google Gemini is the preferred analysis provider, followed by OpenRouter and then Groq. The recommended direct model is `gemini-2.5-flash`. Each request uses structured JSON where supported, one controlled repair/transient retry, and automatic provider fallback.
 
 ```env
+GEMINI_API_KEY=
+GEMINI_TEXT_MODEL=gemini-2.5-flash
 GROQ_TEXT_MODEL=openai/gpt-oss-20b
 OPENROUTER_TEXT_MODEL=google/gemini-2.5-flash
-ANALYSIS_PROVIDERS=groq,openrouter
+ANALYSIS_PROVIDERS=gemini,openrouter,groq
 ANALYSIS_MAX_RETRIES=1
 ANALYSIS_CANDIDATE_MULTIPLIER=3
-ANALYSIS_TRANSCRIPT_MAX_CHARS=90000
+ANALYSIS_TRANSCRIPT_MAX_CHARS=18000
+ANALYSIS_CHUNK_MAX_SECONDS=720
+ANALYSIS_CHUNK_OVERLAP_SEC=30
+ANALYSIS_GROQ_SAFE_CHARS=20000
 ```
 
-The model selects indexed transcript segments rather than inventing timestamps. Timestamp output remains accepted as a compatibility fallback, including clock strings such as `01:55.5`. The backend validates, ranks, and removes overlap before rendering. Video data is never loaded into the analysis prompt.
+Timestamped transcript segments are split by both character budget and time window with overlap. Discovery runs independently on every part; long videos then receive a second, compact global candidate-ranking pass. The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. Groq never receives a prompt above its configured conservative character limit. Video data is never sent to an analysis model.
 
 ## Database migrations
 

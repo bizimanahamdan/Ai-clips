@@ -63,21 +63,28 @@ export const config = {
   transcribeTimeoutSec: num("TRANSCRIBE_TIMEOUT_SEC", 600),
 
   /** Clip analysis -------------------------------------------------------- */
+  geminiApiKey: process.env.GEMINI_API_KEY?.trim() || "",
+  geminiBaseUrl: str("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
+  geminiTextModel: str("GEMINI_TEXT_MODEL", "gemini-2.5-flash"),
   openrouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || "",
   openrouterBaseUrl: str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
   // Keep model IDs environment-configurable: account/model access can differ.
   groqTextModel: str("GROQ_TEXT_MODEL", "openai/gpt-oss-20b"),
   openrouterTextModel: str("OPENROUTER_TEXT_MODEL", "google/gemini-2.5-flash"),
-  /** groq first (fast), then openrouter as optional fallback. */
-  analysisProviders: str("ANALYSIS_PROVIDERS", "groq,openrouter")
+  /** Direct Gemini first, then OpenRouter, then Groq. */
+  analysisProviders: str("ANALYSIS_PROVIDERS", "gemini,openrouter,groq")
     .split(",")
     .map((p) => p.trim().toLowerCase())
-    .filter((p) => p === "groq" || p === "openrouter"),
+    .filter((p) => p === "gemini" || p === "groq" || p === "openrouter"),
   analysisTimeoutSec: num("ANALYSIS_TIMEOUT_SEC", 180),
-  /** Additional corrected attempts per provider; capped at one in V1. */
+  /** One controlled retry for transient or repairable provider failures. */
   analysisMaxRetries: num("ANALYSIS_MAX_RETRIES", 1),
   analysisCandidateMultiplier: num("ANALYSIS_CANDIDATE_MULTIPLIER", 3),
-  analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 90_000),
+  /** Per-request transcript bound; long transcripts are split, never truncated wholesale. */
+  analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 18_000),
+  analysisChunkOverlapSec: num("ANALYSIS_CHUNK_OVERLAP_SEC", 30),
+  analysisChunkMaxSec: num("ANALYSIS_CHUNK_MAX_SECONDS", 720),
+  analysisGroqSafeChars: num("ANALYSIS_GROQ_SAFE_CHARS", 20_000),
 
   /** Output --------------------------------------------------------------- */
   targetWidth: num("TARGET_WIDTH", 1080),
@@ -98,23 +105,29 @@ export const config = {
   maxClipSec: num("MAX_CLIP_SEC", 90),
 } as const;
 
-export type AnalysisProvider = "groq" | "openrouter";
+export type AnalysisProvider = "gemini" | "openrouter" | "groq";
 
 export function transcriptionConfigured(): boolean {
   return config.groqApiKey.length > 0;
 }
 
 export function providersConfigured(): {
+  gemini: boolean;
   groq: boolean;
   openrouter: boolean;
   order: AnalysisProvider[];
 } {
-  const order = config.analysisProviders.filter((p) =>
-    p === "groq" ? transcriptionConfigured() : config.openrouterApiKey.length > 0,
-  );
-  return {
+  const configured = {
+    gemini: config.geminiApiKey.length > 0,
     groq: transcriptionConfigured(),
     openrouter: config.openrouterApiKey.length > 0,
-    order,
   };
+  // Keep fallback deterministic even when an older deployment still has
+  // ANALYSIS_PROVIDERS=groq,openrouter. A configured direct Gemini key is
+  // always enabled and preferred; the env list can still disable fallbacks.
+  const enabled = new Set<AnalysisProvider>(config.analysisProviders);
+  if (configured.gemini) enabled.add("gemini");
+  const order = (["gemini", "openrouter", "groq"] as AnalysisProvider[])
+    .filter((provider) => enabled.has(provider) && configured[provider]);
+  return { ...configured, order };
 }

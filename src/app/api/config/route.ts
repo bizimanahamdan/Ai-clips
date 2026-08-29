@@ -14,8 +14,10 @@ export async function GET() {
     providers: {
       transcription: providers.groq ? "groq" : null,
       analysis: providers.order,
+      geminiConfigured: providers.gemini,
       groqConfigured: providers.groq,
       openrouterConfigured: providers.openrouter,
+      geminiModel: providers.gemini ? config.geminiTextModel : null,
       groqModel: config.groqTextModel,
       transcribeModel: config.groqTranscribeModel,
       openrouterModel: providers.openrouter ? config.openrouterTextModel : null,

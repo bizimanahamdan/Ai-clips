@@ -38,7 +38,9 @@ export type Stage =
   | "analyzing_music"
   | "extracting_audio"
   | "transcribing"
+  | "preparing_transcript"
   | "analyzing"
+  | "ranking"
   | "selecting"
   | "rendering"
   | "finalizing"
@@ -53,8 +55,10 @@ export const STAGE_LABELS: Record<Stage, string> = {
   analyzing_music: "Analyzing background music",
   extracting_audio: "Extracting audio",
   transcribing: "Transcribing audio",
-  analyzing: "AI is picking moments",
-  selecting: "Validating clips",
+  preparing_transcript: "Preparing transcript",
+  analyzing: "AI is analyzing transcript parts",
+  ranking: "Ranking best moments",
+  selecting: "Selecting final clips",
   rendering: "Cutting vertical clips",
   finalizing: "Finishing up",
   done: "Done",
@@ -69,8 +73,10 @@ export const STAGE_WEIGHTS: Record<Exclude<Stage, "done" | "failed">, number> = 
   analyzing_music: 2,
   extracting_audio: 20,
   transcribing: 52,
+  preparing_transcript: 55,
   analyzing: 64,
-  selecting: 68,
+  ranking: 67,
+  selecting: 69,
   rendering: 97,
   finalizing: 99,
 };

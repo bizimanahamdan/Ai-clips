@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { config, type AnalysisProvider } from "./config";
+import { config, providersConfigured, type AnalysisProvider } from "./config";
 import { AppError, describeHttpStatus } from "./errors";
 import type { ClipCandidate, Transcript } from "./types";
 import { preferredClipMin } from "./clip-duration";
@@ -11,6 +11,15 @@ export type AnalysisAttempt = {
   attempt: number;
   outcome: "failed" | "succeeded";
   detail: string;
+  phase?: "discovery" | "selection";
+  chunk?: number;
+};
+
+export type AnalysisProgress = {
+  phase: "preparing" | "discovery" | "selection";
+  completed: number;
+  total: number;
+  message: string;
 };
 
 export type AnalysisResult = {
@@ -19,6 +28,18 @@ export type AnalysisResult = {
   model: string;
   raw: string;
   attempts: AnalysisAttempt[];
+  chunkCount: number;
+  discoveredCandidates: number;
+};
+
+export type TranscriptAnalysisChunk = {
+  index: number;
+  startSegment: number;
+  endSegment: number;
+  startSec: number;
+  endSec: number;
+  characterCount: number;
+  block: string;
 };
 
 function formatClock(seconds: number): string {
@@ -31,24 +52,90 @@ function formatClock(seconds: number): string {
     : `${String(minutes).padStart(2, "0")}:${secs}`;
 }
 
-/**
- * A compact, indexed transcript. The model selects these stable indexes and
- * the backend owns timestamp conversion. No video bytes are sent to the LLM.
- */
+function segmentLine(transcript: Transcript, index: number): string {
+  const segment = transcript.segments[index];
+  return `[S${String(index).padStart(4, "0")} ${formatClock(segment.start)}-${formatClock(segment.end)}] ${segment.text.replace(/\s+/g, " ").trim()}`;
+}
+
+/** Compact indexed transcript retained for backward-compatible tests/tools. */
 export function buildTranscriptPrompt(transcript: Transcript, maxChars = config.analysisTranscriptMaxChars): string {
+  if (!transcript.segments.length) return transcript.text.slice(0, maxChars);
   const lines: string[] = [];
-  let characterCount = 0;
+  let characters = 0;
   for (let index = 0; index < transcript.segments.length; index += 1) {
-    const segment = transcript.segments[index];
-    const line = `[S${String(index).padStart(4, "0")} ${formatClock(segment.start)}-${formatClock(segment.end)}] ${segment.text}`;
-    if (lines.length && characterCount + line.length + 1 > maxChars) {
-      lines.push("…[transcript truncated at configured analysis limit]");
-      break;
-    }
+    const line = segmentLine(transcript, index);
+    if (lines.length && characters + line.length + 1 > maxChars) break;
     lines.push(line);
-    characterCount += line.length + 1;
+    characters += line.length + 1;
   }
-  return lines.join("\n") || transcript.text.slice(0, maxChars);
+  return lines.join("\n");
+}
+
+/**
+ * Split only at timestamped segment boundaries. Adjacent chunks overlap by a
+ * small time window so a complete story crossing a boundary remains visible.
+ */
+export function splitTranscriptForAnalysis(
+  transcript: Transcript,
+  maxChars = config.analysisTranscriptMaxChars,
+  overlapSec = config.analysisChunkOverlapSec,
+  maxChunkSec = config.analysisChunkMaxSec,
+): TranscriptAnalysisChunk[] {
+  if (!transcript.segments.length) {
+    const block = transcript.text.trim();
+    return block ? [{
+      index: 0,
+      startSegment: 0,
+      endSegment: 0,
+      startSec: 0,
+      endSec: transcript.durationSec,
+      characterCount: Math.min(block.length, maxChars),
+      block: block.slice(0, maxChars),
+    }] : [];
+  }
+  // Hard cap protects deployments that still carry the old 90k setting.
+  const safeMaxChars = Math.max(4_000, Math.min(24_000, Math.round(maxChars)));
+  const chunks: TranscriptAnalysisChunk[] = [];
+  let start = 0;
+  while (start < transcript.segments.length) {
+    const lines: string[] = [];
+    let characters = 0;
+    let end = start;
+    while (end < transcript.segments.length) {
+      const line = segmentLine(transcript, end);
+      const exceedsTimeWindow = lines.length > 0 && transcript.segments[end].end - transcript.segments[start].start > maxChunkSec;
+      if (lines.length && (characters + line.length + 1 > safeMaxChars || exceedsTimeWindow)) break;
+      lines.push(line);
+      characters += line.length + 1;
+      end += 1;
+    }
+    // Always make progress even if one unusually large segment exceeds budget.
+    if (end === start) {
+      lines.push(segmentLine(transcript, start).slice(0, safeMaxChars));
+      characters = lines[0].length;
+      end = start + 1;
+    }
+    const first = transcript.segments[start];
+    const last = transcript.segments[end - 1];
+    chunks.push({
+      index: chunks.length,
+      startSegment: start,
+      endSegment: end - 1,
+      startSec: first.start,
+      endSec: last.end,
+      characterCount: characters,
+      block: lines.join("\n"),
+    });
+    if (end >= transcript.segments.length) break;
+    const overlapStartTime = Math.max(first.start, last.end - Math.max(0, overlapSec));
+    let nextStart = end;
+    for (let index = end - 1; index > start; index -= 1) {
+      if (transcript.segments[index].start < overlapStartTime) break;
+      nextStart = index;
+    }
+    start = Math.max(start + 1, nextStart);
+  }
+  return chunks;
 }
 
 export function buildUserPrompt(options: {
@@ -60,55 +147,36 @@ export function buildUserPrompt(options: {
   maxSec: number;
   useSegmentIndexes?: boolean;
   correction?: string;
+  chunkLabel?: string;
+  preferredVibes?: string[];
 }): string {
   const preferredMin = preferredClipMin(options.maxSec, options.minSec);
   const candidateCount = options.candidateCount ?? options.clipCount;
   const selectionContract = options.useSegmentIndexes === false
-    ? "Return startSec and endSec as numeric seconds."
-    : "Return startSegment and endSegment as the integer S indexes shown below (inclusive). Do not calculate timestamps.";
+    ? "Return startSec and endSec as numeric seconds shown by the transcript."
+    : "Return startSegment and endSegment as the integer S indexes shown below (inclusive). Never invent or recalculate timestamps.";
   return [
-    "Act as a senior viral short-form video editor. Analyze narrative quality, not isolated dramatic keywords.",
-    `Video duration: ${formatClock(options.durationSec)} (${options.durationSec.toFixed(1)}s).`,
-    `Generate ${candidateCount} distinct candidates; the backend will rank and select the best ${options.clipCount}.`,
-    `The user selected ${options.maxSec}s maximum. Preferred range: ${preferredMin}-${options.maxSec}s.`,
-    `${options.minSec}s is only a fallback floor. Prefer a complete moment over an arbitrarily short clip.`,
+    "Act as a senior viral short-form editor. Find complete standalone moments, not isolated keywords.",
+    options.chunkLabel ? `Transcript section: ${options.chunkLabel}. Search the entire section, not only its beginning.` : "",
+    `Full video duration: ${formatClock(options.durationSec)}. Return ${candidateCount} distinct candidates.`,
+    `Preferred duration ${preferredMin}-${options.maxSec}s; ${options.minSec}s is only a fallback floor.`,
     selectionContract,
-    "",
-    "For every candidate evaluate:",
-    "- hook strength in the opening seconds",
-    "- enough setup/context for a new viewer",
-    "- development, conflict, discovery, or useful progression",
-    "- emotional, funny, surprising, educational, dramatic, or curiosity value",
-    "- a satisfying payoff/conclusion",
-    "- standalone clarity and likely social-media retention",
-    "",
-    "Hard rules:",
-    "- Select a complete mini-story or complete idea: setup → development → payoff.",
-    "- Never start mid-conversation where pronouns or context are confusing.",
-    "- Never end mid-sentence, before the answer, or before the important reaction/payoff.",
-    "- Do not select a moment merely because it contains an exciting keyword.",
-    "- Keep candidates topically diverse and non-overlapping whenever possible.",
-    `- Strongly prefer ${preferredMin}-${options.maxSec}s. Use ${options.minSec}-${Math.max(options.minSec, preferredMin - 1)}s only if no coherent longer boundary exists.`,
-    "- Score 1-100 using hook, arc, payoff, clarity, emotion/utility, and retention—not sensational wording alone.",
-    "- title: concise social title (1-80 chars); hook: opening promise (1-60 chars); reason: concrete quality rationale (1-240 chars).",
-    "- Return only the requested JSON object.",
+    "Judge hook strength, emotion or useful information, story completeness, payoff, standalone context, and social retention.",
+    "Do not start mid-thought, end before the payoff, or choose multiple versions of the same moment.",
+    options.preferredVibes?.length
+      ? `Weak tie-breaker only: when quality is equal, prefer content compatible with these optional music tags: ${options.preferredVibes.join(", ")}. Never sacrifice clip quality for music.`
+      : "",
+    "JSON only. title must be concise (max 80 chars); hook max 60 chars; reason max 240 chars.",
     options.useSegmentIndexes === false
-      ? '{"clips":[{"startSec":12.5,"endSec":48.2,"title":"...","hook":"...","reason":"...","score":87}]}'
-      : '{"clips":[{"startSegment":42,"endSegment":58,"title":"...","hook":"...","reason":"...","score":92}]}',
-    options.correction ? `\nCORRECTION FOR THIS RETRY: ${options.correction}` : "",
-    "",
-    "Indexed transcript:",
-    "-------------------",
+      ? '{"clips":[{"startSec":12.5,"endSec":48.2,"title":"Concise title","hook":"Short hook","reason":"Brief concrete rationale","score":87}]}'
+      : '{"clips":[{"startSegment":42,"endSegment":58,"title":"Concise title","hook":"Short hook","reason":"Brief concrete rationale","score":92}]}',
+    options.correction ? `CORRECTION: ${options.correction}` : "",
+    "TRANSCRIPT",
     options.transcriptBlock,
-    "-------------------",
   ].filter(Boolean).join("\n");
 }
 
-const SYSTEM_PROMPT = [
-  "You are an expert short-form story editor.",
-  "Choose self-contained narrative moments with hooks, context, development, and payoff.",
-  "Obey the response schema exactly and output JSON only.",
-].join(" ");
+const SYSTEM_PROMPT = "You are an expert short-form story editor. Return strict JSON only. Select real transcript boundaries and complete narrative moments.";
 
 const clipJsonSchema = (useSegments: boolean) => ({
   type: "object",
@@ -118,6 +186,7 @@ const clipJsonSchema = (useSegments: boolean) => ({
     clips: {
       type: "array",
       minItems: 1,
+      maxItems: 12,
       items: {
         type: "object",
         additionalProperties: false,
@@ -138,89 +207,156 @@ const clipJsonSchema = (useSegments: boolean) => ({
   },
 });
 
-type ChatResponse = {
-  choices?: Array<{ message?: { content?: string | null } }>;
+const selectionJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["selections"],
+  properties: {
+    selections: {
+      type: "array",
+      minItems: 1,
+      maxItems: 30,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["candidateId", "score"],
+        properties: {
+          candidateId: { type: "integer", minimum: 0 },
+          score: { type: "integer", minimum: 1, maximum: 100 },
+        },
+      },
+    },
+  },
 };
 
 type ResponseMode = "json_schema" | "json_object";
 
-async function callChat(options: {
-  provider: AnalysisProvider;
+function providerModel(provider: AnalysisProvider): string {
+  if (provider === "gemini") return config.geminiTextModel;
+  return provider === "openrouter" ? config.openrouterTextModel : config.groqTextModel;
+}
+
+async function callOpenAiCompatible(options: {
+  provider: "groq" | "openrouter";
   system: string;
   user: string;
   mode: ResponseMode;
-  useSegments: boolean;
+  schema: Record<string, unknown>;
+  signal: AbortSignal;
 }): Promise<string> {
   const isGroq = options.provider === "groq";
   const baseUrl = isGroq ? config.groqBaseUrl : config.openrouterBaseUrl;
   const key = isGroq ? config.groqApiKey : config.openrouterApiKey;
-  const model = isGroq ? config.groqTextModel : config.openrouterTextModel;
-  const body: Record<string, unknown> = {
-    model,
+  const body = {
+    model: providerModel(options.provider),
     temperature: 0.2,
     max_tokens: 4096,
-    messages: [
-      { role: "system", content: options.system },
-      { role: "user", content: options.user },
-    ],
+    messages: [{ role: "system", content: options.system }, { role: "user", content: options.user }],
     response_format: options.mode === "json_schema"
-      ? {
-          type: "json_schema",
-          json_schema: {
-            name: "clip_candidates",
-            strict: true,
-            schema: clipJsonSchema(options.useSegments),
-          },
-        }
+      ? { type: "json_schema", json_schema: { name: "analysis_result", strict: true, schema: options.schema } }
       : { type: "json_object" },
   };
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+      ...(isGroq ? {} : {
+        "HTTP-Referer": process.env.OPENROUTER_SITE_URL?.trim() || config.frontendUrl || "https://clipforge.local",
+        "X-Title": process.env.OPENROUTER_SITE_NAME?.trim() || "ClipForge",
+      }),
+    },
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    if (response.status === 400 && options.mode === "json_schema") {
+      throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} rejected strict structured output.`, {
+        detail: text.slice(0, 400),
+        status: 502,
+        retryable: true,
+      });
+    }
+    throw describeHttpStatus(response.status, `${isGroq ? "Groq" : "OpenRouter"} analysis`, text);
+  }
+  const parsed = await response.json() as { choices?: Array<{ message?: { content?: string | null } }> };
+  const content = parsed.choices?.[0]?.message?.content;
+  if (!content) throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} returned an empty response.`, { retryable: true });
+  return content;
+}
 
+function toGeminiSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(toGeminiSchema);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== "additionalProperties")
+      .map(([key, item]) => [
+        key,
+        key === "type" && typeof item === "string" ? item.toUpperCase() : toGeminiSchema(item),
+      ]),
+  );
+}
+
+async function callGemini(options: {
+  system: string;
+  user: string;
+  schema: Record<string, unknown>;
+  signal: AbortSignal;
+}): Promise<string> {
+  const endpoint = `${config.geminiBaseUrl}/models/${encodeURIComponent(config.geminiTextModel)}:generateContent`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": config.geminiApiKey },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: options.system }] },
+      contents: [{ role: "user", parts: [{ text: options.user }] }],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 4096,
+        responseMimeType: "application/json",
+        responseSchema: toGeminiSchema(options.schema),
+      },
+    }),
+    signal: options.signal,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw describeHttpStatus(response.status, "Gemini analysis", text);
+  }
+  const parsed = await response.json() as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    promptFeedback?: unknown;
+  };
+  const content = parsed.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
+  if (!content) {
+    throw new AppError("invalid_ai_output", "Gemini returned an empty analysis response.", {
+      detail: JSON.stringify(parsed.promptFeedback ?? parsed).slice(0, 500),
+      retryable: true,
+    });
+  }
+  return content;
+}
+
+async function callProvider(options: {
+  provider: AnalysisProvider;
+  system: string;
+  user: string;
+  mode: ResponseMode;
+  schema: Record<string, unknown>;
+}): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.analysisTimeoutSec * 1000);
   try {
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-        ...(isGroq ? {} : {
-          "HTTP-Referer": process.env.OPENROUTER_SITE_URL?.trim() || config.frontendUrl || "https://clipforge.local",
-          "X-Title": process.env.OPENROUTER_SITE_NAME?.trim() || "ClipForge",
-        }),
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      if (response.status === 400 && options.mode === "json_schema") {
-        throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} rejected strict structured output.`, {
-          detail: text.slice(0, 400),
-          status: 502,
-          retryable: true,
-        });
-      }
-      throw describeHttpStatus(response.status, `${isGroq ? "Groq" : "OpenRouter"} analysis`, text);
-    }
-    const parsed = (await response.json()) as ChatResponse;
-    const content = parsed.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new AppError("invalid_ai_output", "The analysis model returned an empty response.", {
-        detail: JSON.stringify(parsed).slice(0, 400),
-        retryable: true,
-      });
-    }
-    return content;
+    return await (options.provider === "gemini"
+      ? callGemini({ ...options, signal: controller.signal })
+      : callOpenAiCompatible({ ...options, provider: options.provider, signal: controller.signal }));
   } catch (error) {
-    if (error instanceof AppError) throw error;
     if ((error as Error).name === "AbortError") {
-      throw new AppError("invalid_ai_output", `${isGroq ? "Groq" : "OpenRouter"} analysis timed out.`, {
-        retryable: true,
-      });
+      throw new AppError("invalid_ai_output", `${options.provider} analysis timed out.`, { retryable: true });
     }
-    throw new AppError("invalid_ai_output", `Could not reach ${isGroq ? "Groq" : "OpenRouter"}: ${(error as Error).message}`, {
-      retryable: true,
-    });
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -242,21 +378,36 @@ function balancedObjects(content: string): string[] {
       continue;
     }
     if (char === '"') inString = true;
-    else if (char === "{") {
-      if (depth === 0) start = index;
-      depth += 1;
-    } else if (char === "}" && depth > 0) {
-      depth -= 1;
-      if (depth === 0 && start >= 0) results.push(content.slice(start, index + 1));
-    }
+    else if (char === "{") { if (depth === 0) start = index; depth += 1; }
+    else if (char === "}" && depth > 0) { depth -= 1; if (depth === 0 && start >= 0) results.push(content.slice(start, index + 1)); }
   }
   return results;
 }
 
-/** Conservative recovery for a response truncated after otherwise valid JSON. */
+function balancedArrays(content: string): string[] {
+  const results: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "[") { if (depth === 0) start = index; depth += 1; }
+    else if (char === "]" && depth > 0) { depth -= 1; if (depth === 0 && start >= 0) results.push(content.slice(start, index + 1)); }
+  }
+  return results;
+}
+
 function closeTruncatedJson(content: string): string | null {
-  const start = content.indexOf("{");
-  if (start < 0) return null;
+  const start = Math.min(...[content.indexOf("{"), content.indexOf("[")].filter((value) => value >= 0));
+  if (!Number.isFinite(start)) return null;
   let value = content.slice(start).trim().replace(/```[a-z]*$/i, "").trim();
   const stack: string[] = [];
   let inString = false;
@@ -280,17 +431,14 @@ export function extractJson(content: string): unknown {
   const trimmed = content.trim();
   const candidates = new Set<string>([trimmed]);
   for (const match of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.add(match[1].trim());
+  for (const candidate of balancedArrays(trimmed)) candidates.add(candidate);
   for (const candidate of balancedObjects(trimmed)) candidates.add(candidate);
   const repaired = closeTruncatedJson(trimmed);
   if (repaired) candidates.add(repaired);
   for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // Try the next safely extracted candidate.
-    }
+    try { return JSON.parse(candidate); } catch { /* try next safe extraction */ }
   }
-  throw new AppError("invalid_ai_output", "The AI response did not contain a complete JSON object.", {
+  throw new AppError("invalid_ai_output", "The AI response did not contain usable JSON.", {
     detail: trimmed.slice(0, 600),
     retryable: true,
   });
@@ -306,14 +454,42 @@ const RawClipSchema = z.object({
   hook: z.string().trim().min(1).max(60),
   reason: z.string().trim().min(1).max(240),
   score: z.coerce.number().min(1).max(100),
-}).strict().superRefine((clip, context) => {
+}).superRefine((clip, context) => {
   const segmentFields = Number(clip.startSegment !== undefined) + Number(clip.endSegment !== undefined);
   const timeFields = Number(clip.startSec !== undefined) + Number(clip.endSec !== undefined);
   if (!((segmentFields === 2 && timeFields === 0) || (timeFields === 2 && segmentFields === 0))) {
-    context.addIssue({ code: "custom", message: "clip needs exactly one complete segment range or timestamp range" });
+    context.addIssue({ code: "custom", message: "clip needs one complete segment or timestamp range" });
   }
 });
-const RawResponseSchema = z.object({ clips: z.array(RawClipSchema).min(1).max(40) }).strict();
+function trimText(value: unknown, max: number): unknown {
+  if (typeof value !== "string") return value;
+  const clean = value.replace(/\s+/g, " ").trim();
+  return clean.length > max ? clean.slice(0, max).trimEnd() : clean;
+}
+
+function canonicalResponse(value: unknown): unknown {
+  const root = Array.isArray(value) ? { clips: value } : value;
+  if (!root || typeof root !== "object") return root;
+  const record = root as Record<string, unknown>;
+  const entries = record.clips ?? record.moments ?? record.candidates ?? record.data;
+  if (!Array.isArray(entries)) return root;
+  return {
+    clips: entries.map((entry) => {
+      if (!entry || typeof entry !== "object") return entry;
+      const raw = entry as Record<string, unknown>;
+      return {
+        ...(raw.startSegment ?? raw.start_segment) !== undefined ? { startSegment: raw.startSegment ?? raw.start_segment } : {},
+        ...(raw.endSegment ?? raw.end_segment) !== undefined ? { endSegment: raw.endSegment ?? raw.end_segment } : {},
+        ...(raw.startSec ?? raw.start ?? raw.start_time) !== undefined ? { startSec: raw.startSec ?? raw.start ?? raw.start_time } : {},
+        ...(raw.endSec ?? raw.end ?? raw.end_time) !== undefined ? { endSec: raw.endSec ?? raw.end ?? raw.end_time } : {},
+        title: trimText(raw.title ?? raw.headline, 80),
+        hook: trimText(raw.hook ?? raw.opening, 60),
+        reason: trimText(raw.reason ?? raw.rationale ?? raw.description, 240),
+        score: raw.score ?? raw.rating,
+      };
+    }),
+  };
+}
 
 export function parseTimestamp(value: unknown): number | null {
   if (typeof value === "number") return Number.isFinite(value) && value >= 0 ? value : null;
@@ -323,51 +499,35 @@ export function parseTimestamp(value: unknown): number | null {
   const pieces = trimmed.split(":");
   if (pieces.length < 2 || pieces.length > 3 || pieces.some((part) => !/^\d+(?:\.\d+)?$/.test(part))) return null;
   const numbers = pieces.map(Number);
-  const seconds = pieces.length === 2
-    ? numbers[0] * 60 + numbers[1]
-    : numbers[0] * 3600 + numbers[1] * 60 + numbers[2];
+  const seconds = pieces.length === 2 ? numbers[0] * 60 + numbers[1] : numbers[0] * 3600 + numbers[1] * 60 + numbers[2];
   return numbers.at(-1)! < 60 && (pieces.length === 2 || numbers[1] < 60) ? seconds : null;
 }
 
-function canonicalResponse(value: unknown): unknown {
-  if (Array.isArray(value)) return { clips: value };
-  if (!value || typeof value !== "object") return value;
-  const root = value as Record<string, unknown>;
-  const clips = root.clips ?? root.moments ?? root.data;
-  if (!Array.isArray(clips)) return value;
-  const normalised = clips.map((entry) => {
-    if (!entry || typeof entry !== "object") return entry;
-    const clip = { ...(entry as Record<string, unknown>) };
-    if (clip.startSec === undefined && clip.start !== undefined) clip.startSec = clip.start;
-    if (clip.endSec === undefined && clip.end !== undefined) clip.endSec = clip.end;
-    delete clip.start;
-    delete clip.end;
-    return clip;
-  });
-  // Preserve keys when the canonical `clips` field exists so strict schema
-  // validation still rejects unexpected root properties.
-  return Array.isArray(root.clips) ? { ...root, clips: normalised } : { clips: normalised };
-}
-
-function normaliseClips(value: unknown, transcript: Transcript): ClipCandidate[] {
-  const parsed = RawResponseSchema.safeParse(canonicalResponse(value));
-  if (!parsed.success) {
-    throw new AppError("invalid_ai_output", "AI JSON did not match the required clip schema.", {
-      detail: z.prettifyError(parsed.error).slice(0, 1000),
+export function normaliseClips(value: unknown, transcript: Transcript, durationSec: number): ClipCandidate[] {
+  const container = z.object({ clips: z.array(z.unknown()).min(1).max(120) }).safeParse(canonicalResponse(value));
+  if (!container.success) {
+    throw new AppError("invalid_ai_output", "AI JSON did not contain a usable clips array.", {
+      detail: z.prettifyError(container.error).slice(0, 800),
       retryable: true,
     });
   }
-  return parsed.data.clips.map((clip, index) => {
-    let startSec: number | null = null;
-    let endSec: number | null = null;
+  const valid: ClipCandidate[] = [];
+  const issues: string[] = [];
+  container.data.clips.forEach((rawClip, index) => {
+    const parsed = RawClipSchema.safeParse(rawClip);
+    if (!parsed.success) {
+      issues.push(`candidate ${index + 1}: schema mismatch`);
+      return;
+    }
+    const clip = parsed.data;
+    let startSec: number | null;
+    let endSec: number | null;
     if (clip.startSegment !== undefined && clip.endSegment !== undefined) {
       const start = transcript.segments[clip.startSegment];
       const end = transcript.segments[clip.endSegment];
       if (!start || !end || clip.endSegment < clip.startSegment) {
-        throw new AppError("invalid_ai_output", `Candidate ${index + 1} selected invalid transcript segment indexes.`, {
-          detail: `startSegment=${clip.startSegment}, endSegment=${clip.endSegment}, available=0-${Math.max(0, transcript.segments.length - 1)}`,
-          retryable: true,
-        });
+        issues.push(`candidate ${index + 1}: invalid segment indexes`);
+        return;
       }
       startSec = start.start;
       endSec = end.end;
@@ -375,13 +535,11 @@ function normaliseClips(value: unknown, transcript: Transcript): ClipCandidate[]
       startSec = parseTimestamp(clip.startSec);
       endSec = parseTimestamp(clip.endSec);
     }
-    if (startSec === null || endSec === null || endSec <= startSec) {
-      throw new AppError("invalid_ai_output", `Candidate ${index + 1} has an invalid time range.`, {
-        detail: `start=${String(clip.startSec)}, end=${String(clip.endSec)}`,
-        retryable: true,
-      });
+    if (startSec === null || endSec === null || endSec <= startSec || startSec < 0 || endSec > durationSec + 0.1) {
+      issues.push(`candidate ${index + 1}: timestamps outside source duration`);
+      return;
     }
-    return {
+    valid.push({
       startSec,
       endSec,
       startSegment: clip.startSegment,
@@ -390,99 +548,236 @@ function normaliseClips(value: unknown, transcript: Transcript): ClipCandidate[]
       hook: clip.hook,
       reason: clip.reason,
       score: Math.round(clip.score),
-    };
+    });
+  });
+  if (!valid.length) {
+    throw new AppError("invalid_ai_output", "AI response contained no candidates with valid source timestamps.", {
+      detail: issues.slice(0, 12).join("; "),
+      retryable: true,
+    });
+  }
+  return valid;
+}
+
+function configuredProviders(promptChars: number): AnalysisProvider[] {
+  return providersConfigured().order.filter((provider) => {
+    if (provider === "groq" && promptChars > config.analysisGroqSafeChars) {
+      console.info(`[analysis] skipping Groq for ${promptChars} characters (safe limit ${config.analysisGroqSafeChars})`);
+      return false;
+    }
+    return true;
   });
 }
 
-/** Primary → one corrected retry → fallback provider, with no hidden recursion. */
+async function runWithFallback(options: {
+  user: string;
+  schema: Record<string, unknown>;
+  parse: (content: string) => unknown;
+  phase: "discovery" | "selection";
+  chunk?: number;
+  attempts: AnalysisAttempt[];
+}): Promise<{ value: unknown; provider: AnalysisProvider; model: string; raw: string }> {
+  const providers = configuredProviders(options.user.length);
+  if (!providers.length) throw new AppError("missing_api_key", "No suitable AI analysis provider is configured.", { status: 503 });
+  for (const provider of providers) {
+    const model = providerModel(provider);
+    const maxAttempts = Math.max(1, Math.min(2, config.analysisMaxRetries + 1));
+    let correction = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const user = correction ? `${options.user}\nCORRECTION: ${correction}` : options.user;
+        const raw = await callProvider({
+          provider,
+          system: SYSTEM_PROMPT,
+          user,
+          mode: attempt === 1 ? "json_schema" : "json_object",
+          schema: options.schema,
+        });
+        const value = options.parse(raw);
+        options.attempts.push({ provider, model, attempt, outcome: "succeeded", detail: "valid response", phase: options.phase, chunk: options.chunk });
+        return { value, provider, model, raw };
+      } catch (error) {
+        const appError = error instanceof AppError ? error : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
+        const detail = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 300)}` : ""}`;
+        options.attempts.push({ provider, model, attempt, outcome: "failed", detail, phase: options.phase, chunk: options.chunk });
+        console.warn(`[analysis] ${options.phase}${options.chunk !== undefined ? ` chunk ${options.chunk + 1}` : ""} ${provider}/${model} attempt ${attempt} failed: ${detail}`);
+        correction = "Return only complete JSON. Keep title concise, hook <= 60 chars, reason <= 240 chars, and use only supplied IDs/boundaries.";
+        const transient = appError.retryable || appError.kind === "rate_limited";
+        if (!transient || attempt >= maxAttempts) break;
+        if (provider === "gemini") await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+      }
+    }
+  }
+  throw new AppError("invalid_ai_output", `Every configured provider failed during ${options.phase}.`, { retryable: false });
+}
+
+function deduplicateCandidates(candidates: ClipCandidate[]): ClipCandidate[] {
+  const kept: ClipCandidate[] = [];
+  for (const candidate of [...candidates].sort((a, b) => b.score - a.score)) {
+    const duplicate = kept.some((other) => {
+      const overlap = Math.max(0, Math.min(candidate.endSec, other.endSec) - Math.max(candidate.startSec, other.startSec));
+      const shortest = Math.max(1, Math.min(candidate.endSec - candidate.startSec, other.endSec - other.startSec));
+      return overlap / shortest >= 0.65;
+    });
+    if (!duplicate) kept.push(candidate);
+  }
+  return kept;
+}
+
+const SelectionSchema = z.object({
+  selections: z.array(z.object({ candidateId: z.coerce.number().int().nonnegative(), score: z.coerce.number().min(1).max(100) })).min(1).max(40),
+});
+
+function selectionPrompt(candidates: ClipCandidate[], count: number, preferredVibes: string[]): string {
+  const summaries = candidates.map((candidate, index) =>
+    `[C${index}] ${formatClock(candidate.startSec)}-${formatClock(candidate.endSec)} | ${candidate.title} | Hook: ${candidate.hook} | Why: ${candidate.reason} | discoveryScore=${candidate.score}`,
+  );
+  return [
+    "Rank the strongest discovered moments globally. Return candidate IDs only; never create timestamps.",
+    `Select up to ${Math.min(candidates.length, Math.max(count * 3, count))} diverse candidates likely to survive overlap removal.`,
+    "Prioritize strong hook, emotional impact or interesting information, complete story/idea, viral potential, and standalone context.",
+    preferredVibes.length ? `Music tags are a weak tie-breaker only: ${preferredVibes.join(", ")}.` : "",
+    'JSON only: {"selections":[{"candidateId":0,"score":92}]}',
+    ...summaries,
+  ].filter(Boolean).join("\n");
+}
+
+/** Chunked discovery plus global selection; no request contains the full long transcript. */
 export async function analyseTranscript(options: {
   transcript: Transcript;
   durationSec: number;
   clipCount: number;
   maxClipSec: number;
   preferredProvider?: AnalysisProvider | null;
+  preferredVibes?: string[];
+  onProgress?: (progress: AnalysisProgress) => void | Promise<void>;
 }): Promise<AnalysisResult> {
-  const configured: AnalysisProvider[] = [];
-  if (options.preferredProvider) configured.push(options.preferredProvider);
-  for (const provider of config.analysisProviders) if (!configured.includes(provider)) configured.push(provider);
-  const available = configured.filter((provider) =>
-    provider === "groq" ? Boolean(config.groqApiKey) : Boolean(config.openrouterApiKey),
-  );
-  if (!available.length) {
+  void options.preferredProvider; // Provider order is centralized and deterministic.
+  const selectedMaxSec = Math.min(config.maxClipSec, Math.max(config.minClipSec, options.maxClipSec), options.durationSec);
+  const chunkOverlapSec = Math.max(config.analysisChunkOverlapSec, Math.min(90, selectedMaxSec));
+  const chunks = splitTranscriptForAnalysis(options.transcript, config.analysisTranscriptMaxChars, chunkOverlapSec);
+  if (!chunks.length) throw new AppError("invalid_ai_output", "Transcript is empty, so no clip analysis is possible.");
+  const configured = providersConfigured();
+  if (!configured.order.length) {
     throw new AppError("missing_api_key", "No AI analysis provider is configured.", {
       status: 503,
-      detail: "Set GROQ_API_KEY and/or OPENROUTER_API_KEY.",
+      detail: "Set GEMINI_API_KEY, OPENROUTER_API_KEY, and/or GROQ_API_KEY.",
     });
   }
-
-  const transcriptBlock = buildTranscriptPrompt(options.transcript);
-  if (!transcriptBlock.trim()) throw new AppError("invalid_ai_output", "Transcript is empty, so no clip analysis is possible.");
-  const useSegments = options.transcript.segments.length > 0;
-  const selectedMaxSec = Math.min(config.maxClipSec, Math.max(config.minClipSec, options.maxClipSec), options.durationSec);
-  const candidateCount = Math.min(
-    40,
-    Math.max(options.clipCount, Math.round(options.clipCount * config.analysisCandidateMultiplier)),
-  );
+  const targetCandidates = Math.min(40, Math.max(options.clipCount * config.analysisCandidateMultiplier, options.clipCount));
+  const perChunk = Math.min(6, Math.max(3, Math.ceil(targetCandidates / chunks.length) + 1));
+  const preferredVibes = [...new Set((options.preferredVibes ?? []).map((tag) => tag.trim()).filter(Boolean))].slice(0, 12);
   const attempts: AnalysisAttempt[] = [];
+  const candidates: ClipCandidate[] = [];
+  let lastProvider = configured.order[0];
+  let lastModel = providerModel(lastProvider);
+  let lastRaw = "";
 
-  for (const provider of available) {
-    const model = provider === "groq" ? config.groqTextModel : config.openrouterTextModel;
-    const maxAttempts = Math.max(1, Math.min(2, config.analysisMaxRetries + 1));
-    let correction = "";
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      try {
-        const user = buildUserPrompt({
-          transcriptBlock,
-          durationSec: options.durationSec,
-          clipCount: options.clipCount,
-          candidateCount,
-          minSec: Math.min(config.minClipSec, selectedMaxSec),
-          maxSec: selectedMaxSec,
-          useSegmentIndexes: useSegments,
-          correction,
-        });
-        const content = await callChat({
-          provider,
-          system: SYSTEM_PROMPT,
-          user,
-          mode: attempt === 1 ? "json_schema" : "json_object",
-          useSegments,
-        });
-        const clips = normaliseClips(extractJson(content), options.transcript);
-        // Ensure this provider produced at least one renderable candidate before
-        // accepting it; final ranking is repeated in the pipeline with logs.
-        try {
-          validateClips({
-            candidates: clips,
-            durationSec: options.durationSec,
-            transcript: options.transcript,
-            requestedClips: options.clipCount,
-            maxClipSec: options.maxClipSec,
+  await options.onProgress?.({ phase: "preparing", completed: 0, total: chunks.length, message: `Preparing ${chunks.length} transcript part(s)…` });
+  console.info(`[analysis] prepared ${chunks.length} transcript chunk(s), ${options.transcript.segments.length} segments`);
+  for (const chunk of chunks) {
+    await options.onProgress?.({ phase: "discovery", completed: chunk.index, total: chunks.length, message: `Analyzing part ${chunk.index + 1} of ${chunks.length}…` });
+    console.info(`[analysis] analyzing chunk ${chunk.index + 1}/${chunks.length}, segments ${chunk.startSegment}-${chunk.endSegment}, chars=${chunk.characterCount}`);
+    const prompt = buildUserPrompt({
+      transcriptBlock: chunk.block,
+      durationSec: options.durationSec,
+      clipCount: options.clipCount,
+      candidateCount: perChunk,
+      minSec: Math.min(config.minClipSec, selectedMaxSec),
+      maxSec: selectedMaxSec,
+      useSegmentIndexes: options.transcript.segments.length > 0,
+      chunkLabel: `${chunk.index + 1}/${chunks.length}, ${formatClock(chunk.startSec)}-${formatClock(chunk.endSec)}`,
+      preferredVibes,
+    });
+    try {
+      const result = await runWithFallback({
+        user: prompt,
+        schema: clipJsonSchema(options.transcript.segments.length > 0),
+        parse: (raw) => {
+          const parsed = normaliseClips(extractJson(raw), options.transcript, options.durationSec);
+          const insideChunk = parsed.filter((candidate) => {
+            if (candidate.startSegment !== undefined && candidate.endSegment !== undefined) {
+              return candidate.startSegment >= chunk.startSegment && candidate.endSegment <= chunk.endSegment;
+            }
+            return candidate.startSec >= chunk.startSec - 0.1 && candidate.endSec <= chunk.endSec + 0.1;
           });
-        } catch (error) {
-          throw new AppError("invalid_ai_output", "Provider candidates did not survive clip validation.", {
-            detail: error instanceof Error ? error.message : String(error),
-            retryable: true,
-          });
-        }
-        attempts.push({ provider, model, attempt, outcome: "succeeded", detail: `${clips.length} valid candidates` });
-        return { clips, provider, model, raw: content, attempts };
-      } catch (error) {
-        const appError = error instanceof AppError
-          ? error
-          : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
-        const detail = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 300)}` : ""}`;
-        attempts.push({ provider, model, attempt, outcome: "failed", detail });
-        correction = `The previous response failed validation: ${appError.message} Return complete JSON, valid segment indexes, all required fields, and ${candidateCount} distinct candidates.`;
-        // Missing/inaccessible model, bad key and rate limits should fall back
-        // immediately; retry only malformed output/transient failures.
-        if (!appError.retryable || appError.kind === "rate_limited" || appError.kind === "missing_api_key") break;
-        if (attempt >= maxAttempts) break;
+          if (!insideChunk.length) {
+            throw new AppError("invalid_ai_output", "Provider selected boundaries outside the supplied transcript part.", { retryable: true });
+          }
+          return insideChunk;
+        },
+        phase: "discovery",
+        chunk: chunk.index,
+        attempts,
+      });
+      const found = result.value as ClipCandidate[];
+      candidates.push(...found);
+      lastProvider = result.provider;
+      lastModel = result.model;
+      lastRaw = result.raw;
+      console.info(`[analysis] chunk ${chunk.index + 1}/${chunks.length}: ${result.provider}/${result.model} found ${found.length} candidate(s)`);
+    } catch (error) {
+      // One bad chunk must not discard candidates found elsewhere.
+      console.warn(`[analysis] chunk ${chunk.index + 1}/${chunks.length} exhausted providers: ${(error as Error).message}`);
+    }
+    await options.onProgress?.({ phase: "discovery", completed: chunk.index + 1, total: chunks.length, message: `Analyzed part ${chunk.index + 1} of ${chunks.length}; ${candidates.length} candidates found` });
+  }
+
+  let ranked = deduplicateCandidates(candidates);
+  if (!ranked.length) {
+    throw new AppError("invalid_ai_output", "AI analysis could not find usable moments in the transcript.", {
+      detail: `All configured providers were unavailable or returned unusable results for ${chunks.length} transcript part(s). Please retry shortly or check the configured AI providers.`,
+    });
+  }
+  console.info(`[analysis] discovery found ${candidates.length} candidate(s), ${ranked.length} after overlap deduplication`);
+
+  if (chunks.length > 1 && ranked.length > options.clipCount) {
+    await options.onProgress?.({ phase: "selection", completed: 0, total: 1, message: `Ranking ${ranked.length} promising moments…` });
+    const prompt = selectionPrompt(ranked, options.clipCount, preferredVibes);
+    try {
+      const result = await runWithFallback({
+        user: prompt,
+        schema: selectionJsonSchema,
+        parse: (raw) => SelectionSchema.parse(extractJson(raw)),
+        phase: "selection",
+        attempts,
+      });
+      const selection = result.value as z.infer<typeof SelectionSchema>;
+      const selectedIds = new Set<number>();
+      const selected: ClipCandidate[] = [];
+      for (const item of selection.selections) {
+        if (item.candidateId >= ranked.length || selectedIds.has(item.candidateId)) continue;
+        selectedIds.add(item.candidateId);
+        const candidate = ranked[item.candidateId];
+        selected.push({ ...candidate, score: Math.round(candidate.score * 0.7 + item.score * 0.3) });
       }
+      ranked = [...selected, ...ranked.filter((_, index) => !selectedIds.has(index))];
+      lastProvider = result.provider;
+      lastModel = result.model;
+      lastRaw = result.raw;
+      console.info(`[analysis] global selection used ${result.provider}/${result.model} and ranked ${selected.length} candidate(s)`);
+    } catch (error) {
+      // Discovery scores remain a safe global ranking fallback.
+      console.warn(`[analysis] global AI selection failed; using discovery ranking: ${(error as Error).message}`);
     }
   }
 
-  throw new AppError("invalid_ai_output", "AI clip analysis failed on every configured provider.", {
-    detail: attempts.map((item) => `${item.provider}/${item.model} attempt ${item.attempt}: ${item.detail}`).join("\n").slice(0, 3000),
-  });
+  await options.onProgress?.({ phase: "selection", completed: 1, total: 1, message: "Selecting final clips and removing overlaps…" });
+  const final = validateClips({
+    candidates: ranked,
+    durationSec: options.durationSec,
+    transcript: options.transcript,
+    requestedClips: options.clipCount,
+    maxClipSec: options.maxClipSec,
+  }).map(({ index: _index, words: _words, ...clip }) => clip);
+  console.info(`[analysis] final selection: ${final.length} clip(s) from ${chunks.length} chunk(s)`);
+  return {
+    clips: final,
+    provider: lastProvider,
+    model: lastModel,
+    raw: lastRaw,
+    attempts,
+    chunkCount: chunks.length,
+    discoveredCandidates: candidates.length,
+  };
 }

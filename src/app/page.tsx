@@ -10,8 +10,10 @@ type AppConfig = {
   providers: {
     transcription: string | null;
     analysis: string[];
+    geminiConfigured: boolean;
     groqConfigured: boolean;
     openrouterConfigured: boolean;
+    geminiModel: string | null;
     groqModel: string;
     transcribeModel: string;
     openrouterModel: string | null;
@@ -635,12 +637,15 @@ export default function HomePage() {
             Clips are temporary and deleted after {appConfig.limits.retentionHours}h.{" "}
             {appConfig.stats.clipsReady} clip(s) on disk ({appConfig.stats.storageMb}MB). Transcription:{" "}
             {appConfig.providers.groqConfigured ? appConfig.providers.transcribeModel : "not configured"}. Analysis:{" "}
-            {appConfig.providers.groqConfigured
-              ? `${appConfig.providers.groqModel} (Groq)`
+            {appConfig.providers.analysis.length
+              ? appConfig.providers.analysis.map((provider) =>
+                  provider === "gemini"
+                    ? `${appConfig.providers.geminiModel} (Gemini)`
+                    : provider === "openrouter"
+                      ? `${appConfig.providers.openrouterModel} (OpenRouter)`
+                      : `${appConfig.providers.groqModel} (Groq)`,
+                ).join(" → ")
               : "not configured"}
-            {appConfig.providers.openrouterConfigured
-              ? ` → ${appConfig.providers.openrouterModel} (OpenRouter fallback)`
-              : ""}
             .
           </>
         ) : (
