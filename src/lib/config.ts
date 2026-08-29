@@ -44,14 +44,14 @@ export const config = {
 
   /** Ingest --------------------------------------------------------------- */
   maxUploadMb: num("MAX_UPLOAD_MB", 400),
+  maxMusicUploadMb: num("MAX_MUSIC_UPLOAD_MB", 50),
+  maxMusicDurationMinutes: num("MAX_MUSIC_DURATION_MINUTES", 30),
   maxDurationMinutes: num("MAX_DURATION_MINUTES", 120),
   urlDownloadTimeoutSec: num("URL_DOWNLOAD_TIMEOUT_SEC", 600),
   maxUrlSizeMb: num("MAX_URL_SIZE_MB", 800),
   maxUrlRedirects: num("MAX_URL_REDIRECTS", 5),
   /** Direct URL sources are scratch-only unless explicitly retained in R2. */
   persistUrlSources: bool("PERSIST_URL_SOURCES", false),
-  /** Reserved for a future provider adapter; direct URLs are V2's safe default. */
-  allowYtDlp: bool("ALLOW_YTDLP", false),
 
   /** Transcription -------------------------------------------------------- */
   groqApiKey: process.env.GROQ_API_KEY?.trim() || "",
@@ -82,6 +82,9 @@ export const config = {
   /** Output --------------------------------------------------------------- */
   targetWidth: num("TARGET_WIDTH", 1080),
   targetHeight: num("TARGET_HEIGHT", 1920),
+  squareSize: num("OUTPUT_SQUARE_SIZE", 1080),
+  landscapeWidth: num("OUTPUT_LANDSCAPE_WIDTH", 1920),
+  landscapeHeight: num("OUTPUT_LANDSCAPE_HEIGHT", 1080),
   targetFps: num("TARGET_FPS", 30),
   videoCrf: num("VIDEO_CRF", 23),
   videoPreset: str("VIDEO_PRESET", "veryfast"),

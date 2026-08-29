@@ -5,6 +5,8 @@ import { sanitizeFileName } from "@/lib/ingest";
 import { createJob, ensureRuntime } from "@/lib/jobs";
 import { deleteObject, sourceObjectKey, uploadRequestToR2 } from "@/lib/object-storage";
 import { normalizeWhisperLanguage } from "@/lib/transcribe";
+import { normalizeOutputFormat } from "@/lib/output-format";
+import { validateMusicReference } from "@/lib/music";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,6 +15,7 @@ export const maxDuration = 300;
 /** Upload the raw request body directly to durable R2 storage. */
 export async function POST(request: Request) {
   let uploadedKey: string | null = null;
+  let pendingMusicKey: string | null = null;
   try {
     await ensureRuntime();
     const url = new URL(request.url);
@@ -22,6 +25,9 @@ export async function POST(request: Request) {
     const maxClipSec = Number(url.searchParams.get("maxClipSec") ?? "") || undefined;
     const subtitles = url.searchParams.get("subtitles") !== "0";
     const language = normalizeWhisperLanguage(url.searchParams.get("language")) ?? null;
+    const outputFormat = normalizeOutputFormat(url.searchParams.get("outputFormat"));
+    const music = validateMusicReference(url.searchParams.get("musicObjectKey"), url.searchParams.get("musicFileName"));
+    pendingMusicKey = music.objectKey;
 
     const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     uploadedKey = sourceObjectKey(jobId, fileName);
@@ -42,10 +48,15 @@ export async function POST(request: Request) {
       maxClipSec,
       subtitlesEnabled: subtitles,
       language,
+      outputFormat,
+      musicObjectKey: music.objectKey,
+      musicFileName: music.fileName,
     });
+    pendingMusicKey = null;
     return NextResponse.json({ jobId, sizeBytes }, { status: 202 });
   } catch (error) {
     if (uploadedKey) await deleteObject(uploadedKey).catch(() => undefined);
+    if (pendingMusicKey) await deleteObject(pendingMusicKey).catch(() => undefined);
     const payload = toErrorPayload(error);
     return NextResponse.json(
       { error: payload.message, kind: payload.kind, detail: payload.detail },

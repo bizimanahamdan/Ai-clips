@@ -25,7 +25,7 @@ export const jobs = pgTable(
     stageDetail: text("stage_detail"),
     progress: integer("progress").notNull().default(0),
 
-    sourceType: text("source_type").notNull(), // upload | direct_url (`url` is legacy)
+    sourceType: text("source_type").notNull(), // upload | direct_url | dropbox | google_drive (`url` is legacy)
     sourceName: text("source_name").notNull(),
     sourceUrl: text("source_url"),
     /** Local path exists only while a worker is actively processing. */
@@ -46,6 +46,17 @@ export const jobs = pgTable(
     requestedClips: integer("requested_clips").notNull().default(3),
     maxClipSec: integer("max_clip_sec").notNull().default(45),
     subtitlesEnabled: integer("subtitles_enabled").notNull().default(1),
+    outputFormat: text("output_format").notNull().default("9:16"),
+
+    musicObjectKey: text("music_object_key"),
+    musicFileName: text("music_file_name"),
+    musicAnalysis: jsonb("music_analysis").$type<{
+      durationSec: number;
+      averageDb: number | null;
+      peakTimesSec: number[];
+      estimatedBpm: number | null;
+      vibe: string;
+    }>(),
 
     analysisProvider: text("analysis_provider"),
     analysisModel: text("analysis_model"),

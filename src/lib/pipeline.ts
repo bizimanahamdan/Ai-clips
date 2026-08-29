@@ -12,6 +12,8 @@ import { buildAssSubtitles, buildCaptionGroups, subtitleOptionsFor } from "./sub
 import { clipFileName, createJobDir, removePath } from "./storage";
 import { clipObjectKey, uploadFileToR2 } from "./object-storage";
 import { acquireVideoSource } from "./video-source";
+import { acquireAndAnalyzeMusic, musicOffsetForClip } from "./music";
+import { normalizeOutputFormat, outputDimensions } from "./output-format";
 import { extractAndTranscribe } from "./transcribe";
 import { validateClips } from "./validate";
 import type { Stage, Transcript } from "./types";
@@ -71,13 +73,31 @@ export async function runPipeline(jobId: string): Promise<void> {
     ctx.workDir = await createJobDir(jobId);
     await patchJob(ctx, { workDir: ctx.workDir });
 
+    /* Optional music is validated before acquiring/processing the video. */
+    let backgroundMusic: Awaited<ReturnType<typeof acquireAndAnalyzeMusic>> | null = null;
+    if (job.musicObjectKey && job.musicFileName) {
+      await setStage(ctx, "analyzing_music", "Validating and analyzing background music…", 2);
+      backgroundMusic = await acquireAndAnalyzeMusic({
+        objectKey: job.musicObjectKey,
+        fileName: job.musicFileName,
+        workDir: ctx.workDir,
+      });
+      await patchJob(ctx, { musicAnalysis: backgroundMusic.analysis });
+      await log(
+        ctx,
+        "info",
+        "analyzing_music",
+        `Music ready: ${backgroundMusic.analysis.durationSec.toFixed(1)}s, ${backgroundMusic.analysis.vibe}${backgroundMusic.analysis.estimatedBpm ? `, ~${backgroundMusic.analysis.estimatedBpm} BPM` : ""}`,
+      );
+    }
+
     /* 1. Acquire a normalized local source ----------------------------- */
-    const isDirectUrl = job.sourceType === "direct_url" || job.sourceType === "url";
+    const isRemote = job.sourceType !== "upload";
     await setStage(
       ctx,
       "acquiring",
-      isDirectUrl ? "Starting direct video download…" : "Restoring uploaded video from Cloudflare R2…",
-      2,
+      isRemote ? `Starting ${job.sourceType.replace("_", " ")} video download…` : "Restoring uploaded video from Cloudflare R2…",
+      4,
     );
     let lastAcquisitionUpdate = 0;
     const acquired = await acquireVideoSource(job, ctx.workDir, (bytes, total) => {
@@ -89,7 +109,7 @@ export async function runPipeline(jobId: string): Promise<void> {
         ctx,
         "acquiring",
         `Downloading source… ${(bytes / 1024 / 1024).toFixed(1)}MB${total ? ` / ${(total / 1024 / 1024).toFixed(1)}MB` : ""}`,
-        Math.round(2 + ratio * 8),
+        Math.round(4 + ratio * 6),
       ).catch(() => undefined);
     });
     const sourcePath = acquired.localPath;
@@ -221,8 +241,10 @@ export async function runPipeline(jobId: string): Promise<void> {
     );
 
     /* 7. Render ---------------------------------------------------------- */
-    await setStage(ctx, "rendering", `Rendering ${validated.length} vertical clip(s)…`);
-    const subtitleOpts = subtitleOptionsFor(config.targetWidth, config.targetHeight);
+    const outputFormat = normalizeOutputFormat(job.outputFormat);
+    const dimensions = outputDimensions(outputFormat);
+    await setStage(ctx, "rendering", `Rendering ${validated.length} ${outputFormat} clip(s)…`);
+    const subtitleOpts = subtitleOptionsFor(dimensions.width, dimensions.height);
     let readyCount = 0;
     let failedCount = 0;
 
@@ -255,21 +277,22 @@ export async function runPipeline(jobId: string): Promise<void> {
           }
         }
 
-        await renderVerticalClip({
+        const renderOptions = {
           input: sourcePath,
           output: outputPath,
           startSec: clip.startSec,
           endSec: clip.endSec,
           subtitlePath,
           subtitlesEnabled: Boolean(subtitlePath),
-          targetWidth: config.targetWidth,
-          targetHeight: config.targetHeight,
+          targetWidth: dimensions.width,
+          targetHeight: dimensions.height,
           targetFps: config.targetFps,
           crf: config.videoCrf,
           preset: config.videoPreset,
           audioBitrateK: config.audioBitrateK,
           hasAudio: probe.hasAudio,
-          onProgress: (ratio) => {
+          framingMode: outputFormat === "16:9" ? "fit" as const : "crop" as const,
+          onProgress: (ratio: number) => {
             void setStage(
               ctx,
               "rendering",
@@ -277,7 +300,24 @@ export async function runPipeline(jobId: string): Promise<void> {
               Math.round(base + Math.min(1, ratio) * span),
             ).catch(() => undefined);
           },
-        });
+        };
+        try {
+          await renderVerticalClip({
+            ...renderOptions,
+            music: backgroundMusic
+              ? {
+                  input: backgroundMusic.localPath,
+                  startOffsetSec: musicOffsetForClip(backgroundMusic.analysis, index),
+                  volume: backgroundMusic.analysis.vibe === "intense" ? 0.13 : 0.18,
+                }
+              : undefined,
+          });
+        } catch (error) {
+          if (!backgroundMusic) throw error;
+          await log(ctx, "warn", "rendering", `Music mix failed for clip ${index + 1}; retrying safely without music. ${(error as Error).message}`);
+          await fsp.rm(outputPath, { force: true });
+          await renderVerticalClip(renderOptions);
+        }
 
         const outStat = await fsp.stat(outputPath).catch(() => null);
         if (!outStat || outStat.size < 10_000) {

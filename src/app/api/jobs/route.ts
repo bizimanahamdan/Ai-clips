@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
 import { AppError, toErrorPayload } from "@/lib/errors";
-import { assertDirectMediaUrl } from "@/lib/ingest";
 import { createJob, ensureRuntime, listJobs } from "@/lib/jobs";
+import { classifyVideoSourceUrl } from "@/lib/video-source";
 import { normalizeWhisperLanguage } from "@/lib/transcribe";
 import { validatePublicVideoUrl } from "@/lib/url-safety";
+import { normalizeOutputFormat } from "@/lib/output-format";
+import { validateMusicReference } from "@/lib/music";
+import { deleteObject } from "@/lib/object-storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,6 +20,7 @@ export async function GET() {
 
 /** Create a job from a direct media URL. */
 export async function POST(request: Request) {
+  let pendingMusicKey: string | null = null;
   try {
     await ensureRuntime();
     const body = (await request.json().catch(() => ({}))) as {
@@ -25,28 +29,38 @@ export async function POST(request: Request) {
       maxClipSec?: number;
       subtitlesEnabled?: boolean;
       language?: string;
+      outputFormat?: string;
+      musicObjectKey?: string;
+      musicFileName?: string;
     };
 
     const url = (body.url ?? "").trim();
     if (!url) throw new AppError("bad_request", "Paste a video URL first.", { status: 400 });
     if (url.length > 2048) throw new AppError("bad_request", "That URL is too long.", { status: 400 });
 
-    assertDirectMediaUrl(url);
+    const sourceType = classifyVideoSourceUrl(url);
     const validatedUrl = await validatePublicVideoUrl(url);
+    const music = validateMusicReference(body.musicObjectKey, body.musicFileName);
+    pendingMusicKey = music.objectKey;
 
     const fileName = decodeURIComponent(validatedUrl.pathname.split("/").pop() || "video.mp4");
     const jobId = await createJob({
-      sourceType: "direct_url",
+      sourceType,
       sourceName: fileName,
       sourceUrl: validatedUrl.href,
       requestedClips: body.requestedClips,
       maxClipSec: body.maxClipSec,
       subtitlesEnabled: body.subtitlesEnabled,
       language: normalizeWhisperLanguage(body.language) ?? null,
+      outputFormat: normalizeOutputFormat(body.outputFormat),
+      musicObjectKey: music.objectKey,
+      musicFileName: music.fileName,
     });
+    pendingMusicKey = null;
 
     return NextResponse.json({ jobId }, { status: 202 });
   } catch (error) {
+    if (pendingMusicKey) await deleteObject(pendingMusicKey).catch(() => undefined);
     const payload = toErrorPayload(error);
     return NextResponse.json(
       { error: payload.message, kind: payload.kind, detail: payload.detail },

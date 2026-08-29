@@ -51,7 +51,8 @@ export function ClipCard({ clip }: { clip: ApiClip }) {
     <div className="overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03]">
       <div className="relative bg-black">
         <video
-          className="aspect-[9/16] max-h-[62vh] w-full object-contain"
+          className="max-h-[62vh] w-full bg-black object-contain"
+          style={{ aspectRatio: clip.width && clip.height ? `${clip.width} / ${clip.height}` : "9 / 16" }}
           src={clip.playbackUrl ?? undefined}
           controls
           playsInline

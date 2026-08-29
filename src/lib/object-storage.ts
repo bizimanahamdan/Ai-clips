@@ -8,6 +8,7 @@ import {
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -51,6 +52,11 @@ export function sourceObjectKey(jobId: string, fileName: string): string {
 
 export function clipObjectKey(jobId: string, fileName: string): string {
   return `jobs/${jobId}/clips/${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+}
+
+export function pendingMusicObjectKey(fileName: string): string {
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-100) || "music.mp3";
+  return `pending-music/${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeName}`;
 }
 
 async function uploadBody(
@@ -170,6 +176,28 @@ export async function deleteObject(key: string): Promise<void> {
 
 export async function deleteObjects(keys: Array<string | null | undefined>): Promise<void> {
   await Promise.all(keys.filter((key): key is string => Boolean(key)).map((key) => deleteObject(key)));
+}
+
+/** Remove browser-uploaded music that was never attached to a job. */
+export async function deletePendingMusicOlderThan(cutoff: Date, protectedKeys: ReadonlySet<string> = new Set()): Promise<number> {
+  let continuationToken: string | undefined;
+  let removed = 0;
+  do {
+    const page = await r2().send(new ListObjectsV2Command({
+      Bucket: config.r2BucketName,
+      Prefix: "pending-music/",
+      ContinuationToken: continuationToken,
+    }));
+    const stale = (page.Contents ?? []).filter(
+      (item): item is typeof item & { Key: string } => Boolean(
+        item.Key && item.LastModified && item.LastModified < cutoff && !protectedKeys.has(item.Key),
+      ),
+    );
+    await deleteObjects(stale.map((item) => item.Key));
+    removed += stale.length;
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return removed;
 }
 
 export async function checkR2(): Promise<{ bucket: string; endpoint: string }> {

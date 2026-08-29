@@ -241,6 +241,75 @@ export async function extractAudio(options: {
   await run(ffmpegBin(), args, { timeoutSec: 900 });
 }
 
+export type MusicEnergyAnalysis = {
+  durationSec: number;
+  averageDb: number | null;
+  peakTimesSec: number[];
+  estimatedBpm: number | null;
+  vibe: string;
+};
+
+/** Lightweight half-second RMS analysis; no ML model or persistent process. */
+export async function analyzeMusicEnergy(filePath: string): Promise<MusicEnergyAnalysis> {
+  const durationSec = await mediaDurationSeconds(filePath);
+  const samples: Array<{ time: number; db: number }> = [];
+  let currentTime = 0;
+  let remainder = "";
+  const parseLine = (line: string) => {
+    const time = line.match(/pts_time:([\d.]+)/);
+    if (time) currentTime = Number(time[1]);
+    const rms = line.match(/lavfi\.astats\.Overall\.RMS_level=([-\d.]+)/);
+    if (rms) {
+      const db = Number(rms[1]);
+      if (Number.isFinite(db)) samples.push({ time: currentTime, db });
+    }
+  };
+  await run(
+    ffmpegBin(),
+    [
+      "-hide_banner", "-nostats", "-i", filePath,
+      "-af", "aresample=16000,asetnsamples=n=8000:p=0,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+      "-f", "null", "-",
+    ],
+    {
+      capture: true,
+      timeoutSec: Math.max(120, Math.round(durationSec * 2)),
+      onStderr(chunk) {
+        const lines = `${remainder}${chunk}`.split("\n");
+        remainder = lines.pop() ?? "";
+        for (const line of lines) parseLine(line);
+      },
+    },
+  );
+  if (remainder) parseLine(remainder);
+  const averageDb = samples.length ? samples.reduce((sum, sample) => sum + sample.db, 0) / samples.length : null;
+  const localPeaks = samples.filter((sample, index) => {
+    const previous = samples[index - 1]?.db ?? -Infinity;
+    const next = samples[index + 1]?.db ?? -Infinity;
+    return sample.db >= previous && sample.db > next && (averageDb === null || sample.db >= averageDb + 2.5);
+  });
+  const peakTimesSec: number[] = [];
+  for (const peak of localPeaks) {
+    if (!peakTimesSec.length || peak.time - peakTimesSec[peakTimesSec.length - 1] >= 0.35) {
+      peakTimesSec.push(Number(peak.time.toFixed(3)));
+    }
+  }
+  const intervals = peakTimesSec.slice(1).map((time, index) => time - peakTimesSec[index]).filter((value) => value >= 0.33 && value <= 2);
+  intervals.sort((a, b) => a - b);
+  const medianInterval = intervals.length ? intervals[Math.floor(intervals.length / 2)] : null;
+  let estimatedBpm = medianInterval ? 60 / medianInterval : null;
+  while (estimatedBpm && estimatedBpm < 60) estimatedBpm *= 2;
+  while (estimatedBpm && estimatedBpm > 180) estimatedBpm /= 2;
+  const vibe = averageDb === null ? "unknown" : averageDb > -14 ? "intense" : averageDb > -22 ? "energetic" : averageDb > -32 ? "balanced" : "calm";
+  return {
+    durationSec,
+    averageDb: averageDb === null ? null : Number(averageDb.toFixed(2)),
+    peakTimesSec: peakTimesSec.slice(0, 500),
+    estimatedBpm: estimatedBpm ? Math.round(estimatedBpm) : null,
+    vibe,
+  };
+}
+
 export async function mediaDurationSeconds(filePath: string): Promise<number> {
   const { stdout } = await run(
     ffprobeBin(),
@@ -270,41 +339,65 @@ export async function renderVerticalClip(options: {
   preset: string;
   audioBitrateK: number;
   hasAudio: boolean;
+  framingMode?: "crop" | "fit";
+  music?: { input: string; startOffsetSec: number; volume?: number };
   onProgress?: RenderProgress;
 }): Promise<void> {
   const duration = Math.max(0.5, options.endSec - options.startSec);
-  const crop = [
-    `crop=w='min(iw,ih*${options.targetWidth}/${options.targetHeight})':h='min(ih,iw*${options.targetHeight}/${options.targetWidth})'`,
-    `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=increase`,
-    `crop=${options.targetWidth}:${options.targetHeight}`,
-    `fps=${options.targetFps}`,
-    "setsar=1",
-  ];
+  const videoFilters = options.framingMode === "fit"
+    ? [
+        `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=decrease`,
+        `pad=${options.targetWidth}:${options.targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black`,
+        `fps=${options.targetFps}`,
+        "setsar=1",
+      ]
+    : [
+        `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=increase`,
+        `crop=${options.targetWidth}:${options.targetHeight}:(iw-ow)/2:(ih-oh)/2`,
+        `fps=${options.targetFps}`,
+        "setsar=1",
+      ];
   if (options.subtitlesEnabled && options.subtitlePath) {
-    crop.push(`ass=${quoteFilterPath(options.subtitlePath)}:fontsdir=${quoteFilterPath(fontsDir())}`);
+    videoFilters.push(`ass=${quoteFilterPath(options.subtitlePath)}:fontsdir=${quoteFilterPath(fontsDir())}`);
   }
-  const vf = crop.join(",");
 
   const args = [
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-stats",
-    "-y",
-    "-ss",
-    options.startSec.toFixed(3),
-    "-i",
-    options.input,
-    "-t",
-    duration.toFixed(3),
-    "-vf",
-    vf,
+    "-hide_banner", "-loglevel", "warning", "-stats", "-y",
+    "-ss", options.startSec.toFixed(3), "-i", options.input,
   ];
+  if (options.music) {
+    args.push(
+      "-stream_loop", "-1",
+      "-ss", Math.max(0, options.music.startOffsetSec).toFixed(3),
+      "-i", options.music.input,
+    );
+  }
+  args.push("-t", duration.toFixed(3));
 
-  if (options.hasAudio) {
-    args.push("-map", "0:v:0", "-map", "0:a:0?", "-c:a", "aac", "-b:a", `${options.audioBitrateK}k`, "-ar", "44100", "-ac", "2");
+  if (options.music) {
+    const volume = Math.max(0.03, Math.min(0.5, options.music.volume ?? 0.18));
+    const fadeOutStart = Math.max(0, duration - 1);
+    const audioFilters = [
+      `[0:v]${videoFilters.join(",")}[vout]`,
+      `[1:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${Math.min(0.8, duration / 3).toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration).toFixed(3)}[music]`,
+    ];
+    if (options.hasAudio) {
+      audioFilters.push(
+        "[music][0:a:0]sidechaincompress=threshold=0.025:ratio=8:attack=20:release=400[ducked]",
+        "[0:a:0][ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]",
+      );
+    } else {
+      audioFilters.push("[music]alimiter=limit=0.95[aout]");
+    }
+    args.push("-filter_complex", audioFilters.join(";"), "-map", "[vout]", "-map", "[aout]");
   } else {
-    args.push("-map", "0:v:0", "-an");
+    args.push("-vf", videoFilters.join(","), "-map", "0:v:0");
+    if (options.hasAudio) args.push("-map", "0:a:0?");
+    else args.push("-an");
+  }
+
+  if (options.hasAudio || options.music) {
+    args.push("-c:a", "aac", "-b:a", `${options.audioBitrateK}k`, "-ar", "44100", "-ac", "2");
   }
 
   args.push(

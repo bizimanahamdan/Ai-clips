@@ -33,8 +33,12 @@ export async function GET() {
       maxConcurrentJobs: config.maxConcurrentJobs,
     },
     output: {
-      width: config.targetWidth,
-      height: config.targetHeight,
+      defaultFormat: "9:16",
+      formats: {
+        "9:16": { width: config.targetWidth, height: config.targetHeight },
+        "1:1": { width: config.squareSize, height: config.squareSize },
+        "16:9": { width: config.landscapeWidth, height: config.landscapeHeight },
+      },
       fps: config.targetFps,
       crf: config.videoCrf,
     },

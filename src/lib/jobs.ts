@@ -12,7 +12,8 @@ import {
   jobRoot,
   removePath,
 } from "./storage";
-import { checkR2, deleteObjects, objectExists } from "./object-storage";
+import { checkR2, deleteObjects, deletePendingMusicOlderThan, objectExists } from "./object-storage";
+import { normalizeOutputFormat, type OutputFormat } from "./output-format";
 import type { ApiJob, JobStatus, Stage } from "./types";
 import { STAGE_LABELS } from "./types";
 
@@ -64,7 +65,7 @@ async function boot(): Promise<void> {
       continue;
     }
     // A URL can be downloaded again; an upload can resume from durable R2.
-    const sourceAlive = job.sourceType === "direct_url" || job.sourceType === "url" || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
+    const sourceAlive = ["direct_url", "dropbox", "google_drive", "url"].includes(job.sourceType) || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
     if (sourceAlive) {
       // Durable source survived the restart: requeue from the beginning.
       await db
@@ -191,7 +192,7 @@ export function queueSnapshot(): { pending: number; running: number } {
 /* Cleanup                                                             */
 /* ------------------------------------------------------------------ */
 
-export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: string[] }> {
+export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: string[]; removedPendingMusic: number }> {
   const cutoff = new Date(Date.now() - config.retentionHours * 3600 * 1000);
 
   const expired = await db
@@ -206,13 +207,16 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
 
   const ids = removable.map((job) => job.id);
   if (ids.length) {
-    const sources = await db.select({ key: jobs.sourceObjectKey }).from(jobs).where(inArray(jobs.id, ids));
+    const sources = await db
+      .select({ key: jobs.sourceObjectKey, musicKey: jobs.musicObjectKey })
+      .from(jobs)
+      .where(inArray(jobs.id, ids));
     const storedClips = await db
       .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
       .from(clips)
       .where(inArray(clips.jobId, ids));
     await deleteObjects([
-      ...sources.map((item) => item.key),
+      ...sources.flatMap((item) => [item.key, item.musicKey]),
       ...storedClips.flatMap((item) => [item.key, item.posterKey]),
     ]);
     await db.delete(jobs).where(inArray(jobs.id, ids));
@@ -220,8 +224,11 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
 
   const { purgeExpiredJobs } = await import("./storage");
   const removedDirs = await purgeExpiredJobs((expiresAt) => Boolean(expiresAt && expiresAt.getTime() <= Date.now()));
+  const referencedMusic = await db.select({ key: jobs.musicObjectKey }).from(jobs);
+  const protectedMusicKeys = new Set(referencedMusic.flatMap((item) => item.key ? [item.key] : []));
+  const removedPendingMusic = await deletePendingMusicOlderThan(cutoff, protectedMusicKeys);
 
-  return { removedJobs: ids.length, removedDirs };
+  return { removedJobs: ids.length, removedDirs, removedPendingMusic };
 }
 
 export function startCleanupScheduler(): void {
@@ -243,7 +250,7 @@ export function startCleanupScheduler(): void {
 
 export type CreateJobInput = {
   id?: string;
-  sourceType: "upload" | "direct_url" | "url";
+  sourceType: "upload" | "direct_url" | "dropbox" | "google_drive" | "url";
   sourceName: string;
   sourceUrl?: string | null;
   filePath?: string | null;
@@ -253,6 +260,9 @@ export type CreateJobInput = {
   maxClipSec?: number;
   subtitlesEnabled?: boolean;
   language?: string | null;
+  outputFormat?: OutputFormat;
+  musicObjectKey?: string | null;
+  musicFileName?: string | null;
 };
 
 export async function createJob(input: CreateJobInput): Promise<string> {
@@ -283,6 +293,9 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     maxClipSec,
     subtitlesEnabled: input.subtitlesEnabled === false ? 0 : 1,
     language: input.language ?? null,
+    outputFormat: normalizeOutputFormat(input.outputFormat),
+    musicObjectKey: input.musicObjectKey ?? null,
+    musicFileName: input.musicFileName?.slice(0, 200) ?? null,
     workDir: jobRoot(id),
     expiresAt: new Date(Date.now() + config.retentionHours * 3600 * 1000),
   });
@@ -290,8 +303,8 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     jobId: id,
     stage: "queued",
     message:
-      input.sourceType === "direct_url" || input.sourceType === "url"
-        ? `Direct URL job queued: ${input.sourceUrl}`
+      input.sourceType !== "upload"
+        ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
         : `Job queued for upload: ${input.sourceName} (${((input.fileSizeBytes ?? 0) / (1024 * 1024)).toFixed(1)}MB)`,
   });
   enqueue(id);
@@ -355,6 +368,8 @@ export async function getJob(jobId: string): Promise<ApiJob | null> {
     requestedClips: job.requestedClips,
     maxClipSec: job.maxClipSec,
     subtitlesEnabled: job.subtitlesEnabled === 1,
+    outputFormat: normalizeOutputFormat(job.outputFormat),
+    musicFileName: job.musicFileName,
     analysisProvider: job.analysisProvider,
     analysisModel: job.analysisModel,
     error: job.error ?? null,
@@ -402,6 +417,8 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
     requestedClips: job.requestedClips,
     maxClipSec: job.maxClipSec,
     subtitlesEnabled: job.subtitlesEnabled === 1,
+    outputFormat: normalizeOutputFormat(job.outputFormat),
+    musicFileName: job.musicFileName,
     analysisProvider: job.analysisProvider,
     analysisModel: job.analysisModel,
     error: job.error ?? null,
@@ -423,6 +440,7 @@ export async function deleteJob(jobId: string): Promise<void> {
     .where(eq(clips.jobId, jobId));
   await deleteObjects([
     job.sourceObjectKey,
+    job.musicObjectKey,
     ...storedClips.flatMap((item) => [item.key, item.posterKey]),
   ]);
   await db.delete(jobs).where(eq(jobs.id, jobId));

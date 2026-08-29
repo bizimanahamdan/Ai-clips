@@ -102,7 +102,11 @@ MAX_CONCURRENT_JOBS=1
 RETENTION_HOURS=24
 MAX_URL_REDIRECTS=5
 PERSIST_URL_SOURCES=false
-ALLOW_YTDLP=false
+MAX_MUSIC_UPLOAD_MB=50
+MAX_MUSIC_DURATION_MINUTES=30
+OUTPUT_SQUARE_SIZE=1080
+OUTPUT_LANDSCAPE_WIDTH=1920
+OUTPUT_LANDSCAPE_HEIGHT=1080
 ```
 
 See `.env.example` for every tuning variable. Secrets are only read by server modules and are not returned by `/api/config` or embedded in frontend code.
@@ -138,13 +142,19 @@ Job state and events are persisted in PostgreSQL. At startup, queued jobs are re
 
 The V2 queue is intentionally in the web process. Render must remain a single long-running instance. A future multi-instance deployment should move queue claiming to PostgreSQL or a dedicated queue/worker service.
 
-## Version 2 direct URL flow
+## Modular URL and media flow
 
 1. The API parses the URL, permits only HTTP/HTTPS without embedded credentials, resolves DNS, and rejects loopback, private, link-local, reserved, and internal hostnames.
-2. Social/webpage providers are rejected clearly; V2 starts with direct public video files.
-3. The worker source registry selects the `direct_url` adapter. Every redirect is handled manually and receives the same SSRF validation.
-4. The response Content-Type and size are checked before streaming. A transform enforces `MAX_URL_SIZE_MB` even when Content-Length is absent, and an abort timer enforces `URL_DOWNLOAD_TIMEOUT_SEC`.
-5. The adapter returns one normalized local file to the unchanged probe → transcription → analysis → validation → render pipeline.
-6. The pipeline `finally` block removes the entire job scratch directory after success or failure. Only final clips/posters use the existing R2 output storage by default.
+2. The `VideoSourceAdapter` registry detects direct media, public Dropbox shares, and public Google Drive file shares. Known social/webpage providers are rejected with provider-specific guidance; webpage HTML is never passed to FFmpeg.
+3. Dropbox and Drive adapters resolve only their authorized public file-link forms. The resulting download URL and every manual redirect receive the same DNS/IP SSRF validation.
+4. Content type and size are checked before streaming. A transform enforces `MAX_URL_SIZE_MB` even without Content-Length, and an abort timer enforces `URL_DOWNLOAD_TIMEOUT_SEC`.
+5. Every adapter returns one normalized local file to the shared probe → transcription → analysis → validation → render pipeline.
+6. The pipeline `finally` block removes the entire job scratch directory after success or failure. Only configured retained sources and final clips/posters remain in R2.
 
-New source adapters can be added to `src/lib/video-source.ts` without changing the processing pipeline.
+New authorized source adapters can be added to `src/lib/video-source.ts` without changing downstream processing.
+
+## Output formats and optional music
+
+Output format is selected before job creation and persisted on the job. Vertical and square outputs use aspect-preserving center crop; landscape uses aspect-preserving fit and padding, so video is never stretched. Dimensions are configurable with `TARGET_WIDTH`, `TARGET_HEIGHT`, `OUTPUT_SQUARE_SIZE`, `OUTPUT_LANDSCAPE_WIDTH`, and `OUTPUT_LANDSCAPE_HEIGHT`.
+
+Optional MP3, WAV, M4A, or AAC music streams to a pending R2 object. Before video acquisition/transcription, FFprobe validates its audio stream, size, and duration and FFmpeg performs lightweight RMS-energy, peak, approximate-tempo, and vibe analysis. Rendering starts near detected energy peaks when feasible, loops/trims and fades the music, ducks it under speech with sidechain compression, mixes without normalization surprises, and applies a limiter. If music mixing is unsupported by the host FFmpeg build, that clip is retried without music; no-music jobs use the normal rendering path.

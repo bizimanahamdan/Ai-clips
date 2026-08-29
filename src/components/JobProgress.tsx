@@ -41,6 +41,11 @@ export function JobProgress({ job }: { job: ApiJob }) {
         />
       </div>
 
+      <div className="mt-2 flex items-center gap-2 text-[10px] text-slate-500">
+        <span className="rounded bg-white/5 px-1.5 py-0.5">{job.outputFormat}</span>
+        {job.musicFileName ? <span className="min-w-0 truncate">♫ {job.musicFileName}</span> : <span>No music</span>}
+      </div>
+
       <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
         <span>{job.progress}%</span>
         <span className="truncate">

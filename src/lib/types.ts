@@ -35,6 +35,7 @@ export type Stage =
   | "acquiring"
   | "ingesting"
   | "probing"
+  | "analyzing_music"
   | "extracting_audio"
   | "transcribing"
   | "analyzing"
@@ -49,6 +50,7 @@ export const STAGE_LABELS: Record<Stage, string> = {
   acquiring: "Acquiring source video",
   ingesting: "Getting the video",
   probing: "Checking the video",
+  analyzing_music: "Analyzing background music",
   extracting_audio: "Extracting audio",
   transcribing: "Transcribing audio",
   analyzing: "AI is picking moments",
@@ -61,9 +63,10 @@ export const STAGE_LABELS: Record<Stage, string> = {
 
 export const STAGE_WEIGHTS: Record<Exclude<Stage, "done" | "failed">, number> = {
   queued: 1,
-  acquiring: 2,
+  acquiring: 4,
   ingesting: 10,
   probing: 13,
+  analyzing_music: 2,
   extracting_audio: 20,
   transcribing: 52,
   analyzing: 64,
@@ -116,6 +119,8 @@ export type ApiJob = {
   requestedClips: number;
   maxClipSec: number;
   subtitlesEnabled: boolean;
+  outputFormat: "9:16" | "1:1" | "16:9";
+  musicFileName: string | null;
   analysisProvider: string | null;
   analysisModel: string | null;
   error: { message: string; stage: string; detail?: string; kind?: string } | null;

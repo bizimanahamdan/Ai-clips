@@ -17,6 +17,7 @@ type AppConfig = {
   };
   limits: {
     maxUploadMb: number;
+    maxMusicUploadMb: number;
     maxUrlSizeMb: number;
     urlDownloadTimeoutSec: number;
     maxDurationMinutes: number;
@@ -27,12 +28,19 @@ type AppConfig = {
     retentionHours: number;
     maxConcurrentJobs: number;
   };
-  output: { width: number; height: number; fps: number; crf: number };
+  output: {
+    defaultFormat: OutputFormat;
+    formats: Record<OutputFormat, { width: number; height: number }>;
+    fps: number;
+    crf: number;
+  };
   queue: { pending: number; running: number };
   stats: { total: number; active: number; clipsReady: number; storageMb: number };
 };
 
 type Mode = "upload" | "url";
+type OutputFormat = "9:16" | "1:1" | "16:9";
+type MusicReference = { objectKey: string; fileName: string };
 
 export default function HomePage() {
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
@@ -43,8 +51,11 @@ export default function HomePage() {
   const [clipCount, setClipCount] = useState(3);
   const [maxClipSec, setMaxClipSec] = useState(45);
   const [subtitles, setSubtitles] = useState(true);
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("9:16");
+  const [musicFile, setMusicFile] = useState<File | null>(null);
 
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
+  const [musicUploadPercent, setMusicUploadPercent] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<{ message: string; detail?: string } | null>(null);
   const [activeJob, setActiveJob] = useState<ApiJob | null>(null);
@@ -123,7 +134,54 @@ export default function HomePage() {
     };
   }, [activeJob?.id, activeJob?.status, poll]);
 
-  const submitUpload = useCallback(() => {
+  const uploadBackgroundMusic = useCallback(async (): Promise<MusicReference | null> => {
+    if (!musicFile) return null;
+    if (limits && musicFile.size > limits.maxMusicUploadMb * 1024 * 1024) {
+      throw new Error(`Background music exceeds the ${limits.maxMusicUploadMb}MB limit.`);
+    }
+    setMusicUploadPercent(0);
+    return new Promise<MusicReference>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/music/upload");
+      xhr.setRequestHeader("x-file-name", encodeURIComponent(musicFile.name));
+      xhr.setRequestHeader("Content-Type", musicFile.type || "application/octet-stream");
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) setMusicUploadPercent(Math.round((event.loaded / event.total) * 100));
+      };
+      xhr.onload = () => {
+        setMusicUploadPercent(null);
+        try {
+          const data = JSON.parse(xhr.responseText) as MusicReference & { error?: string };
+          if (xhr.status >= 200 && xhr.status < 300 && data.objectKey) resolve(data);
+          else reject(new Error(data.error || `Music upload failed (${xhr.status})`));
+        } catch {
+          reject(new Error(`Music upload failed (${xhr.status})`));
+        }
+      };
+      xhr.onerror = () => {
+        setMusicUploadPercent(null);
+        reject(new Error("Background music upload failed. Check your connection."));
+      };
+      xhr.send(musicFile);
+    });
+  }, [limits, musicFile]);
+
+  const discardMusicReference = useCallback(async (reference: MusicReference | null) => {
+    if (!reference) return;
+    await fetch("/api/music/upload", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objectKey: reference.objectKey }),
+    }).catch(() => undefined);
+  }, []);
+
+  const clearMusicInput = useCallback(() => {
+    setMusicFile(null);
+    const input = document.getElementById("music-input") as HTMLInputElement | null;
+    if (input) input.value = "";
+  }, []);
+
+  const submitUpload = useCallback(async () => {
     if (!file) {
       setError({ message: "Choose a video file first." });
       return;
@@ -139,12 +197,27 @@ export default function HomePage() {
     setError(null);
     setUploadPercent(0);
 
+    let musicReference: MusicReference | null = null;
+    try {
+      musicReference = await uploadBackgroundMusic();
+    } catch (err) {
+      setSubmitting(false);
+      setUploadPercent(null);
+      setError({ message: (err as Error).message });
+      return;
+    }
+
     const params = new URLSearchParams({
       filename: encodeURIComponent(file.name),
       clips: String(clipCount),
       maxClipSec: String(maxClipSec),
       subtitles: subtitles ? "1" : "0",
+      outputFormat,
     });
+    if (musicReference) {
+      params.set("musicObjectKey", musicReference.objectKey);
+      params.set("musicFileName", musicReference.fileName);
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/jobs/upload?${params.toString()}`);
     xhr.setRequestHeader("x-file-name", encodeURIComponent(file.name));
@@ -164,6 +237,7 @@ export default function HomePage() {
           setFile(null);
           const input = document.getElementById("file-input") as HTMLInputElement | null;
           if (input) input.value = "";
+          clearMusicInput();
           void loadHistory();
           setActiveJob({
             id: data.jobId,
@@ -182,6 +256,8 @@ export default function HomePage() {
             requestedClips: clipCount,
             maxClipSec,
             subtitlesEnabled: subtitles,
+            outputFormat,
+            musicFileName: musicReference?.fileName ?? null,
             analysisProvider: null,
             analysisModel: null,
             error: null,
@@ -193,21 +269,24 @@ export default function HomePage() {
             transcriptPreview: null,
           });
         } else {
+          void discardMusicReference(musicReference);
           setError({ message: data.error || `Upload failed (${xhr.status})`, detail: data.detail });
         }
       } catch {
+        void discardMusicReference(musicReference);
         setError({ message: `Upload failed (${xhr.status}): could not read the server response.` });
       }
     };
     xhr.onerror = () => {
       setSubmitting(false);
       setUploadPercent(null);
+      void discardMusicReference(musicReference);
       setError({
         message: "Upload failed before reaching the server. Check your connection and try a smaller file.",
       });
     };
     xhr.send(file);
-  }, [clipCount, file, limits, loadHistory, maxClipSec, subtitles]);
+  }, [clearMusicInput, clipCount, discardMusicReference, file, limits, loadHistory, maxClipSec, outputFormat, subtitles, uploadBackgroundMusic]);
 
   const submitUrl = useCallback(async () => {
     setError(null);
@@ -216,7 +295,9 @@ export default function HomePage() {
       return;
     }
     setSubmitting(true);
+    let musicReference: MusicReference | null = null;
     try {
+      musicReference = await uploadBackgroundMusic();
       const response = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -225,22 +306,28 @@ export default function HomePage() {
           requestedClips: clipCount,
           maxClipSec,
           subtitlesEnabled: subtitles,
+          outputFormat,
+          musicObjectKey: musicReference?.objectKey,
+          musicFileName: musicReference?.fileName,
         }),
       });
       const data = (await response.json()) as { jobId?: string; error?: string; detail?: string };
       if (!response.ok || !data.jobId) {
+        void discardMusicReference(musicReference);
         setError({ message: data.error || `Request failed (${response.status})`, detail: data.detail });
         return;
       }
       setVideoUrl("");
+      clearMusicInput();
       void loadHistory();
       void poll(data.jobId);
     } catch (err) {
+      void discardMusicReference(musicReference);
       setError({ message: (err as Error).message });
     } finally {
       setSubmitting(false);
     }
-  }, [clipCount, loadHistory, maxClipSec, poll, subtitles, videoUrl]);
+  }, [clearMusicInput, clipCount, discardMusicReference, loadHistory, maxClipSec, outputFormat, poll, subtitles, uploadBackgroundMusic, videoUrl]);
 
   const retry = useCallback(async (jobId: string) => {
     setError(null);
@@ -303,7 +390,7 @@ export default function HomePage() {
             </span>
             {appConfig ? (
               <span className="text-[10px] text-slate-500">
-                {appConfig.output.width}×{appConfig.output.height} · {appConfig.output.fps}fps
+                {appConfig.output.formats[outputFormat].width}×{appConfig.output.formats[outputFormat].height} · {appConfig.output.fps}fps
               </span>
             ) : null}
           </div>
@@ -386,7 +473,7 @@ export default function HomePage() {
               className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-sm text-white placeholder:text-slate-500 focus:border-indigo-400 focus:outline-none"
             />
             <p className="text-[11px] leading-relaxed text-slate-500">
-              Paste a <span className="text-slate-300">direct public video file</span> such as MP4, MOV, MKV, or WEBM.
+              Paste a direct MP4/MOV/MKV/WEBM URL or a public <span className="text-slate-300">Dropbox / Google Drive</span> file link.
               Maximum {limits?.maxUrlSizeMb ?? "—"}MB and {limits?.maxDurationMinutes ?? "—"} minutes. YouTube, TikTok, and other webpage links are not supported yet.
             </p>
             <button
@@ -399,6 +486,65 @@ export default function HomePage() {
             </button>
           </div>
         )}
+
+        {/* Output format */}
+        <div className="mt-4 space-y-2">
+          <span className="text-[11px] font-medium text-slate-400">Output format</span>
+          <div className="grid grid-cols-3 gap-1 rounded-xl bg-black/20 p-1">
+            {([
+              ["9:16", "📱 9:16", "Shorts · Reels · TikTok"],
+              ["1:1", "🟦 1:1", "Feed Posts"],
+              ["16:9", "🖥️ 16:9", "Landscape · YouTube"],
+            ] as Array<[OutputFormat, string, string]>).map(([value, label, description]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setOutputFormat(value)}
+                disabled={busy}
+                className={`rounded-lg px-2 py-2 text-center transition ${outputFormat === value ? "bg-indigo-500 text-white" : "text-slate-400 hover:bg-white/5"}`}
+              >
+                <span className="block text-xs font-semibold">{label}</span>
+                <span className="mt-0.5 block text-[9px] leading-tight opacity-75">{description}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Optional music */}
+        <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
+          <label htmlFor="music-input" className="flex cursor-pointer items-center justify-between gap-3">
+            <span>
+              <span className="block text-xs font-medium text-slate-300">Optional background music</span>
+              <span className="mt-0.5 block text-[10px] text-slate-500">MP3, WAV, M4A, AAC · max {limits?.maxMusicUploadMb ?? "—"}MB</span>
+            </span>
+            <span className="max-w-[42%] truncate rounded-lg bg-white/5 px-2.5 py-1.5 text-[10px] text-slate-300">
+              {musicFile ? musicFile.name : "Choose audio"}
+            </span>
+            <input
+              id="music-input"
+              type="file"
+              accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac"
+              className="hidden"
+              onChange={(event) => {
+                setError(null);
+                setMusicFile(event.target.files?.[0] ?? null);
+              }}
+            />
+          </label>
+          {musicFile ? (
+            <button type="button" onClick={clearMusicInput} className="mt-2 text-[10px] text-slate-500 hover:text-slate-300">
+              Remove music
+            </button>
+          ) : null}
+          {musicUploadPercent !== null ? (
+            <div className="mt-2">
+              <div className="mb-1 text-[10px] text-slate-400">Uploading music… {musicUploadPercent}%</div>
+              <div className="h-1 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full bg-fuchsia-400 transition-all" style={{ width: `${musicUploadPercent}%` }} />
+              </div>
+            </div>
+          ) : null}
+        </div>
 
         {/* Options */}
         <div className="mt-4 grid grid-cols-2 gap-3">
