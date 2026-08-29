@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { clips, jobEvents, jobs } from "@/db/schema";
+import { clips, jobEvents, jobMediaAssets, jobs } from "@/db/schema";
 import { config } from "./config";
 import { AppError, toErrorPayload } from "./errors";
 import { checkBinaries } from "./ffmpeg";
@@ -14,6 +14,7 @@ import {
 } from "./storage";
 import { checkR2, deleteObjects, deletePendingMusicOlderThan, objectExists } from "./object-storage";
 import { normalizeOutputFormat, type OutputFormat } from "./output-format";
+import { normalizeAssetIds, normalizeMediaMode, resolveJobAssets, type MediaMode } from "./media-library";
 import type { ApiJob, JobStatus, Stage } from "./types";
 import { STAGE_LABELS } from "./types";
 
@@ -263,6 +264,9 @@ export type CreateJobInput = {
   outputFormat?: OutputFormat;
   musicObjectKey?: string | null;
   musicFileName?: string | null;
+  mediaMode?: MediaMode;
+  musicAssetIds?: string[];
+  soundEffectAssetIds?: string[];
 };
 
 export async function createJob(input: CreateJobInput): Promise<string> {
@@ -278,34 +282,51 @@ export async function createJob(input: CreateJobInput): Promise<string> {
     Math.max(config.minClipSec, Math.round(input.maxClipSec ?? 45)),
   );
 
-  const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  await db.insert(jobs).values({
-    id,
-    status: "queued",
-    stage: "queued",
-    sourceType: input.sourceType,
-    sourceName: input.sourceName.slice(0, 200),
-    sourceUrl: input.sourceUrl ?? null,
-    filePath: input.filePath ?? null,
-    sourceObjectKey: input.sourceObjectKey ?? null,
-    fileSizeBytes: input.fileSizeBytes ?? null,
-    requestedClips,
-    maxClipSec,
-    subtitlesEnabled: input.subtitlesEnabled === false ? 0 : 1,
-    language: input.language ?? null,
-    outputFormat: normalizeOutputFormat(input.outputFormat),
-    musicObjectKey: input.musicObjectKey ?? null,
-    musicFileName: input.musicFileName?.slice(0, 200) ?? null,
-    workDir: jobRoot(id),
-    expiresAt: new Date(Date.now() + config.retentionHours * 3600 * 1000),
+  const mediaMode = normalizeMediaMode(input.mediaMode);
+  const selectedAssets = await resolveJobAssets({
+    mediaMode,
+    musicIds: normalizeAssetIds(input.musicAssetIds),
+    soundEffectIds: normalizeAssetIds(input.soundEffectAssetIds),
   });
-  await db.insert(jobEvents).values({
-    jobId: id,
-    stage: "queued",
-    message:
-      input.sourceType !== "upload"
-        ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
-        : `Job queued for upload: ${input.sourceName} (${((input.fileSizeBytes ?? 0) / (1024 * 1024)).toFixed(1)}MB)`,
+  const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await db.transaction(async (tx) => {
+    await tx.insert(jobs).values({
+      id,
+      status: "queued",
+      stage: "queued",
+      sourceType: input.sourceType,
+      sourceName: input.sourceName.slice(0, 200),
+      sourceUrl: input.sourceUrl ?? null,
+      filePath: input.filePath ?? null,
+      sourceObjectKey: input.sourceObjectKey ?? null,
+      fileSizeBytes: input.fileSizeBytes ?? null,
+      requestedClips,
+      maxClipSec,
+      subtitlesEnabled: input.subtitlesEnabled === false ? 0 : 1,
+      language: input.language ?? null,
+      outputFormat: normalizeOutputFormat(input.outputFormat),
+      musicObjectKey: input.musicObjectKey ?? null,
+      musicFileName: input.musicFileName?.slice(0, 200) ?? null,
+      mediaMode,
+      workDir: jobRoot(id),
+      expiresAt: new Date(Date.now() + config.retentionHours * 3600 * 1000),
+    });
+    if (selectedAssets.length) {
+      await tx.insert(jobMediaAssets).values(selectedAssets.map((item) => ({
+        jobId: id,
+        assetId: item.asset.id,
+        role: item.role,
+        sortOrder: item.sortOrder,
+      })));
+    }
+    await tx.insert(jobEvents).values({
+      jobId: id,
+      stage: "queued",
+      message:
+        input.sourceType !== "upload"
+          ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
+          : `Job queued for upload: ${input.sourceName} (${((input.fileSizeBytes ?? 0) / (1024 * 1024)).toFixed(1)}MB)`,
+    });
   });
   enqueue(id);
   return id;
@@ -342,6 +363,11 @@ export async function getJob(jobId: string): Promise<ApiJob | null> {
     .where(eq(clips.jobId, jobId))
     .orderBy(asc(clips.clipIndex));
 
+  const mediaRows = await db
+    .select({ assetId: jobMediaAssets.assetId, role: jobMediaAssets.role })
+    .from(jobMediaAssets)
+    .where(eq(jobMediaAssets.jobId, jobId));
+
   const eventRows = await db
     .select()
     .from(jobEvents)
@@ -370,6 +396,9 @@ export async function getJob(jobId: string): Promise<ApiJob | null> {
     subtitlesEnabled: job.subtitlesEnabled === 1,
     outputFormat: normalizeOutputFormat(job.outputFormat),
     musicFileName: job.musicFileName,
+    mediaMode: normalizeMediaMode(job.mediaMode),
+    musicAssetIds: mediaRows.filter((item) => item.role === "music").map((item) => item.assetId),
+    soundEffectAssetIds: mediaRows.filter((item) => item.role === "sound_effect").map((item) => item.assetId),
     analysisProvider: job.analysisProvider,
     analysisModel: job.analysisModel,
     error: job.error ?? null,
@@ -399,6 +428,10 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
     .from(clips)
     .where(inArray(clips.jobId, ids))
     .orderBy(asc(clips.clipIndex));
+  const mediaRows = await db
+    .select({ jobId: jobMediaAssets.jobId, assetId: jobMediaAssets.assetId, role: jobMediaAssets.role })
+    .from(jobMediaAssets)
+    .where(inArray(jobMediaAssets.jobId, ids));
 
   return rows.map((job) => ({
     id: job.id,
@@ -419,6 +452,9 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
     subtitlesEnabled: job.subtitlesEnabled === 1,
     outputFormat: normalizeOutputFormat(job.outputFormat),
     musicFileName: job.musicFileName,
+    mediaMode: normalizeMediaMode(job.mediaMode),
+    musicAssetIds: mediaRows.filter((item) => item.jobId === job.id && item.role === "music").map((item) => item.assetId),
+    soundEffectAssetIds: mediaRows.filter((item) => item.jobId === job.id && item.role === "sound_effect").map((item) => item.assetId),
     analysisProvider: job.analysisProvider,
     analysisModel: job.analysisModel,
     error: job.error ?? null,

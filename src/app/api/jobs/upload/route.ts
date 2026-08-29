@@ -26,6 +26,9 @@ export async function POST(request: Request) {
     const subtitles = url.searchParams.get("subtitles") !== "0";
     const language = normalizeWhisperLanguage(url.searchParams.get("language")) ?? null;
     const outputFormat = normalizeOutputFormat(url.searchParams.get("outputFormat"));
+    const mediaMode = url.searchParams.get("mediaMode") as "none" | "manual" | "auto" | null;
+    const musicAssetIds = url.searchParams.get("musicAssetIds")?.split(",") ?? [];
+    const soundEffectAssetIds = url.searchParams.get("soundEffectAssetIds")?.split(",") ?? [];
     const music = validateMusicReference(url.searchParams.get("musicObjectKey"), url.searchParams.get("musicFileName"));
     pendingMusicKey = music.objectKey;
 
@@ -51,6 +54,9 @@ export async function POST(request: Request) {
       outputFormat,
       musicObjectKey: music.objectKey,
       musicFileName: music.fileName,
+      mediaMode: mediaMode ?? undefined,
+      musicAssetIds,
+      soundEffectAssetIds,
     });
     pendingMusicKey = null;
     return NextResponse.json({ jobId, sizeBytes }, { status: 202 });

@@ -32,6 +32,9 @@ export async function POST(request: Request) {
       outputFormat?: string;
       musicObjectKey?: string;
       musicFileName?: string;
+      mediaMode?: "none" | "manual" | "auto";
+      musicAssetIds?: string[];
+      soundEffectAssetIds?: string[];
     };
 
     const url = (body.url ?? "").trim();
@@ -55,6 +58,9 @@ export async function POST(request: Request) {
       outputFormat: normalizeOutputFormat(body.outputFormat),
       musicObjectKey: music.objectKey,
       musicFileName: music.fileName,
+      mediaMode: body.mediaMode,
+      musicAssetIds: body.musicAssetIds,
+      soundEffectAssetIds: body.soundEffectAssetIds,
     });
     pendingMusicKey = null;
 

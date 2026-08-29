@@ -121,6 +121,9 @@ export type ApiJob = {
   subtitlesEnabled: boolean;
   outputFormat: "9:16" | "1:1" | "16:9";
   musicFileName: string | null;
+  mediaMode: "none" | "manual" | "auto";
+  musicAssetIds: string[];
+  soundEffectAssetIds: string[];
   analysisProvider: string | null;
   analysisModel: string | null;
   error: { message: string; stage: string; detail?: string; kind?: string } | null;

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ClipCard, formatBytes } from "@/components/ClipCard";
 import { JobProgress } from "@/components/JobProgress";
@@ -40,7 +41,16 @@ type AppConfig = {
 
 type Mode = "upload" | "url";
 type OutputFormat = "9:16" | "1:1" | "16:9";
-type MusicReference = { objectKey: string; fileName: string };
+type MediaMode = "none" | "manual" | "auto";
+type LibraryAsset = {
+  id: string;
+  category: "music" | "sound_effect";
+  name: string;
+  fileName: string;
+  durationSec: number;
+  tags: string[];
+  playbackUrl: string;
+};
 
 export default function HomePage() {
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
@@ -52,10 +62,12 @@ export default function HomePage() {
   const [maxClipSec, setMaxClipSec] = useState(45);
   const [subtitles, setSubtitles] = useState(true);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("9:16");
-  const [musicFile, setMusicFile] = useState<File | null>(null);
+  const [mediaMode, setMediaMode] = useState<MediaMode>("none");
+  const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
+  const [selectedMusicIds, setSelectedMusicIds] = useState<string[]>([]);
+  const [selectedEffectIds, setSelectedEffectIds] = useState<string[]>([]);
 
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
-  const [musicUploadPercent, setMusicUploadPercent] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<{ message: string; detail?: string } | null>(null);
   const [activeJob, setActiveJob] = useState<ApiJob | null>(null);
@@ -74,6 +86,17 @@ export default function HomePage() {
       setConfigError(null);
     } catch (err) {
       setConfigError((err as Error).message);
+    }
+  }, []);
+
+  const loadLibrary = useCallback(async () => {
+    try {
+      const response = await fetch("/api/media", { cache: "no-store" });
+      if (!response.ok) return;
+      const data = (await response.json()) as { assets: LibraryAsset[] };
+      setLibraryAssets(data.assets ?? []);
+    } catch {
+      /* library remains optional */
     }
   }, []);
 
@@ -99,9 +122,10 @@ export default function HomePage() {
     const timer = window.setTimeout(() => {
       void loadConfig();
       void loadHistory();
+      void loadLibrary();
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [loadConfig, loadHistory]);
+  }, [loadConfig, loadHistory, loadLibrary]);
 
   const poll = useCallback(async (jobId: string) => {
     try {
@@ -134,200 +158,97 @@ export default function HomePage() {
     };
   }, [activeJob?.id, activeJob?.status, poll]);
 
-  const uploadBackgroundMusic = useCallback(async (): Promise<MusicReference | null> => {
-    if (!musicFile) return null;
-    if (limits && musicFile.size > limits.maxMusicUploadMb * 1024 * 1024) {
-      throw new Error(`Background music exceeds the ${limits.maxMusicUploadMb}MB limit.`);
-    }
-    setMusicUploadPercent(0);
-    return new Promise<MusicReference>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/music/upload");
-      xhr.setRequestHeader("x-file-name", encodeURIComponent(musicFile.name));
-      xhr.setRequestHeader("Content-Type", musicFile.type || "application/octet-stream");
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) setMusicUploadPercent(Math.round((event.loaded / event.total) * 100));
-      };
-      xhr.onload = () => {
-        setMusicUploadPercent(null);
-        try {
-          const data = JSON.parse(xhr.responseText) as MusicReference & { error?: string };
-          if (xhr.status >= 200 && xhr.status < 300 && data.objectKey) resolve(data);
-          else reject(new Error(data.error || `Music upload failed (${xhr.status})`));
-        } catch {
-          reject(new Error(`Music upload failed (${xhr.status})`));
-        }
-      };
-      xhr.onerror = () => {
-        setMusicUploadPercent(null);
-        reject(new Error("Background music upload failed. Check your connection."));
-      };
-      xhr.send(musicFile);
-    });
-  }, [limits, musicFile]);
-
-  const discardMusicReference = useCallback(async (reference: MusicReference | null) => {
-    if (!reference) return;
-    await fetch("/api/music/upload", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ objectKey: reference.objectKey }),
-    }).catch(() => undefined);
-  }, []);
-
-  const clearMusicInput = useCallback(() => {
-    setMusicFile(null);
-    const input = document.getElementById("music-input") as HTMLInputElement | null;
-    if (input) input.value = "";
-  }, []);
-
-  const submitUpload = useCallback(async () => {
+  const submitUpload = useCallback(() => {
     if (!file) {
       setError({ message: "Choose a video file first." });
       return;
     }
     if (limits && file.size > limits.maxUploadMb * 1024 * 1024) {
-      setError({
-        message: `That file is ${formatBytes(file.size)} — the server limit is ${limits.maxUploadMb}MB.`,
-      });
+      setError({ message: `That file is ${formatBytes(file.size)} — the server limit is ${limits.maxUploadMb}MB.` });
       return;
     }
-
     setSubmitting(true);
     setError(null);
     setUploadPercent(0);
-
-    let musicReference: MusicReference | null = null;
-    try {
-      musicReference = await uploadBackgroundMusic();
-    } catch (err) {
-      setSubmitting(false);
-      setUploadPercent(null);
-      setError({ message: (err as Error).message });
-      return;
-    }
-
     const params = new URLSearchParams({
       filename: encodeURIComponent(file.name),
       clips: String(clipCount),
       maxClipSec: String(maxClipSec),
       subtitles: subtitles ? "1" : "0",
       outputFormat,
+      mediaMode,
+      musicAssetIds: selectedMusicIds.join(","),
+      soundEffectAssetIds: selectedEffectIds.join(","),
     });
-    if (musicReference) {
-      params.set("musicObjectKey", musicReference.objectKey);
-      params.set("musicFileName", musicReference.fileName);
-    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/jobs/upload?${params.toString()}`);
     xhr.setRequestHeader("x-file-name", encodeURIComponent(file.name));
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
-
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) {
-        setUploadPercent(Math.round((event.loaded / event.total) * 100));
-      }
-    };
+    xhr.upload.onprogress = (event) => event.lengthComputable && setUploadPercent(Math.round((event.loaded / event.total) * 100));
     xhr.onload = () => {
       setSubmitting(false);
       setUploadPercent(null);
       try {
         const data = JSON.parse(xhr.responseText) as { jobId?: string; error?: string; detail?: string };
-        if (xhr.status >= 200 && xhr.status < 300 && data.jobId) {
-          setFile(null);
-          const input = document.getElementById("file-input") as HTMLInputElement | null;
-          if (input) input.value = "";
-          clearMusicInput();
-          void loadHistory();
-          setActiveJob({
-            id: data.jobId,
-            status: "queued",
-            stage: "queued",
-            stageLabel: "Queued",
-            stageDetail: "Waiting for a worker slot",
-            progress: 1,
-            sourceType: "upload",
-            sourceName: file.name,
-            durationSec: null,
-            width: null,
-            height: null,
-            fileSizeBytes: file.size,
-            language: null,
-            requestedClips: clipCount,
-            maxClipSec,
-            subtitlesEnabled: subtitles,
-            outputFormat,
-            musicFileName: musicReference?.fileName ?? null,
-            analysisProvider: null,
-            analysisModel: null,
-            error: null,
-            createdAt: new Date().toISOString(),
-            finishedAt: null,
-            expiresAt: null,
-            clips: [],
-            events: [],
-            transcriptPreview: null,
-          });
-        } else {
-          void discardMusicReference(musicReference);
+        if (xhr.status < 200 || xhr.status >= 300 || !data.jobId) {
           setError({ message: data.error || `Upload failed (${xhr.status})`, detail: data.detail });
+          return;
         }
+        setFile(null);
+        const input = document.getElementById("file-input") as HTMLInputElement | null;
+        if (input) input.value = "";
+        void loadHistory();
+        setActiveJob({
+          id: data.jobId, status: "queued", stage: "queued", stageLabel: "Queued",
+          stageDetail: "Waiting for a worker slot", progress: 1, sourceType: "upload", sourceName: file.name,
+          durationSec: null, width: null, height: null, fileSizeBytes: file.size, language: null,
+          requestedClips: clipCount, maxClipSec, subtitlesEnabled: subtitles, outputFormat,
+          musicFileName: null, mediaMode, musicAssetIds: selectedMusicIds, soundEffectAssetIds: selectedEffectIds,
+          analysisProvider: null, analysisModel: null, error: null, createdAt: new Date().toISOString(),
+          finishedAt: null, expiresAt: null, clips: [], events: [], transcriptPreview: null,
+        });
       } catch {
-        void discardMusicReference(musicReference);
         setError({ message: `Upload failed (${xhr.status}): could not read the server response.` });
       }
     };
     xhr.onerror = () => {
       setSubmitting(false);
       setUploadPercent(null);
-      void discardMusicReference(musicReference);
-      setError({
-        message: "Upload failed before reaching the server. Check your connection and try a smaller file.",
-      });
+      setError({ message: "Upload failed before reaching the server. Check your connection and try a smaller file." });
     };
     xhr.send(file);
-  }, [clearMusicInput, clipCount, discardMusicReference, file, limits, loadHistory, maxClipSec, outputFormat, subtitles, uploadBackgroundMusic]);
+  }, [clipCount, file, limits, loadHistory, maxClipSec, mediaMode, outputFormat, selectedEffectIds, selectedMusicIds, subtitles]);
 
   const submitUrl = useCallback(async () => {
     setError(null);
     if (!videoUrl.trim()) {
-      setError({ message: "Paste a direct video URL first." });
+      setError({ message: "Paste a video URL first." });
       return;
     }
     setSubmitting(true);
-    let musicReference: MusicReference | null = null;
     try {
-      musicReference = await uploadBackgroundMusic();
       const response = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          url: videoUrl.trim(),
-          requestedClips: clipCount,
-          maxClipSec,
-          subtitlesEnabled: subtitles,
-          outputFormat,
-          musicObjectKey: musicReference?.objectKey,
-          musicFileName: musicReference?.fileName,
+          url: videoUrl.trim(), requestedClips: clipCount, maxClipSec, subtitlesEnabled: subtitles,
+          outputFormat, mediaMode, musicAssetIds: selectedMusicIds, soundEffectAssetIds: selectedEffectIds,
         }),
       });
       const data = (await response.json()) as { jobId?: string; error?: string; detail?: string };
       if (!response.ok || !data.jobId) {
-        void discardMusicReference(musicReference);
         setError({ message: data.error || `Request failed (${response.status})`, detail: data.detail });
         return;
       }
       setVideoUrl("");
-      clearMusicInput();
       void loadHistory();
       void poll(data.jobId);
     } catch (err) {
-      void discardMusicReference(musicReference);
       setError({ message: (err as Error).message });
     } finally {
       setSubmitting(false);
     }
-  }, [clearMusicInput, clipCount, discardMusicReference, loadHistory, maxClipSec, outputFormat, poll, subtitles, uploadBackgroundMusic, videoUrl]);
+  }, [clipCount, loadHistory, maxClipSec, mediaMode, outputFormat, poll, selectedEffectIds, selectedMusicIds, subtitles, videoUrl]);
 
   const retry = useCallback(async (jobId: string) => {
     setError(null);
@@ -376,7 +297,8 @@ export default function HomePage() {
         <div className="flex items-center justify-between gap-3">
           <div>
             <h1 className="text-xl font-bold tracking-tight text-white">ClipForge</h1>
-            <p className="text-xs text-slate-400">Long video → vertical clips with captions</p>
+            <p className="text-xs text-slate-400">Long video → reusable-media-powered clips</p>
+            <Link href="/media-library" className="mt-1 inline-block text-[10px] font-medium text-indigo-300">🎵 Media Library →</Link>
           </div>
           <div className="flex flex-col items-end gap-1">
             <span
@@ -510,40 +432,43 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* Optional music */}
+        {/* Reusable media library */}
         <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-3">
-          <label htmlFor="music-input" className="flex cursor-pointer items-center justify-between gap-3">
-            <span>
-              <span className="block text-xs font-medium text-slate-300">Optional background music</span>
-              <span className="mt-0.5 block text-[10px] text-slate-500">MP3, WAV, M4A, AAC · max {limits?.maxMusicUploadMb ?? "—"}MB</span>
-            </span>
-            <span className="max-w-[42%] truncate rounded-lg bg-white/5 px-2.5 py-1.5 text-[10px] text-slate-300">
-              {musicFile ? musicFile.name : "Choose audio"}
-            </span>
-            <input
-              id="music-input"
-              type="file"
-              accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac"
-              className="hidden"
-              onChange={(event) => {
-                setError(null);
-                setMusicFile(event.target.files?.[0] ?? null);
-              }}
-            />
-          </label>
-          {musicFile ? (
-            <button type="button" onClick={clearMusicInput} className="mt-2 text-[10px] text-slate-500 hover:text-slate-300">
-              Remove music
-            </button>
-          ) : null}
-          {musicUploadPercent !== null ? (
-            <div className="mt-2">
-              <div className="mb-1 text-[10px] text-slate-400">Uploading music… {musicUploadPercent}%</div>
-              <div className="h-1 overflow-hidden rounded-full bg-white/10">
-                <div className="h-full bg-fuchsia-400 transition-all" style={{ width: `${musicUploadPercent}%` }} />
-              </div>
+          <div className="flex items-center justify-between gap-3">
+            <div><span className="block text-xs font-medium text-slate-300">Media Library</span><span className="text-[10px] text-slate-500">Reuse analyzed audio without uploading it again</span></div>
+            <Link href="/media-library" className="shrink-0 rounded-lg bg-white/5 px-2.5 py-1.5 text-[10px] text-indigo-300">Manage library</Link>
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-1 rounded-lg bg-black/20 p-1">
+            {([['none', 'No music'], ['manual', 'Manual'], ['auto', '✨ Auto-match']] as Array<[MediaMode, string]>).map(([value, label]) => (
+              <button key={value} type="button" onClick={() => setMediaMode(value)} className={`rounded-md px-2 py-2 text-[10px] font-semibold ${mediaMode === value ? 'bg-indigo-500 text-white' : 'text-slate-400'}`}>{label}</button>
+            ))}
+          </div>
+          {mediaMode !== "none" ? (
+            <div className="mt-3 space-y-1.5">
+              <p className="text-[10px] text-slate-500">{mediaMode === "auto" ? "Choose a candidate pool, or leave all unchecked to let auto-match use the full music library." : "Select one or more tracks. Multiple tracks rotate across clips."}</p>
+              {libraryAssets.filter((asset) => asset.category === "music").map((asset) => (
+                <label key={asset.id} className="flex cursor-pointer items-center gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
+                  <input type="checkbox" checked={selectedMusicIds.includes(asset.id)} onChange={() => setSelectedMusicIds((current) => current.includes(asset.id) ? current.filter((id) => id !== asset.id) : [...current, asset.id])} className="accent-indigo-500" />
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-slate-300">🎵 {asset.name}</span>
+                  <span className="text-[9px] text-slate-600">{asset.tags.slice(0, 2).join(" · ")}</span>
+                </label>
+              ))}
+              {!libraryAssets.some((asset) => asset.category === "music") ? <p className="rounded-lg border border-dashed border-white/10 p-3 text-center text-[10px] text-slate-500">No music yet. Add tracks in Media Library.</p> : null}
             </div>
           ) : null}
+          <details className="mt-3">
+            <summary className="cursor-pointer text-[11px] font-medium text-slate-400">🔊 Optional sound effects {selectedEffectIds.length ? `(${selectedEffectIds.length})` : ""}</summary>
+            <div className="mt-2 space-y-1.5">
+              {libraryAssets.filter((asset) => asset.category === "sound_effect").map((asset) => (
+                <label key={asset.id} className="flex cursor-pointer items-center gap-2 rounded-lg bg-white/[0.03] px-2.5 py-2">
+                  <input type="checkbox" checked={selectedEffectIds.includes(asset.id)} onChange={() => setSelectedEffectIds((current) => current.includes(asset.id) ? current.filter((id) => id !== asset.id) : [...current, asset.id])} className="accent-fuchsia-500" />
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-slate-300">{asset.name}</span>
+                  <span className="text-[9px] text-slate-600">{asset.tags.slice(0, 2).join(" · ")}</span>
+                </label>
+              ))}
+              {!libraryAssets.some((asset) => asset.category === "sound_effect") ? <p className="text-[10px] text-slate-500">No sound effects in the library.</p> : null}
+            </div>
+          </details>
         </div>
 
         {/* Options */}
@@ -669,7 +594,9 @@ export default function HomePage() {
                   <span className="block truncate text-xs font-medium text-slate-200">{job.sourceName}</span>
                   <span className="block truncate text-[11px] text-slate-500">
                     {new Date(job.createdAt).toLocaleString()} ·{" "}
-                    {job.clips.filter((clip) => clip.status === "ready").length} clip(s)
+                    {job.clips.filter((clip) => clip.status === "ready").length} clip(s) · {job.outputFormat}
+                    {job.musicAssetIds.length ? ` · ${job.mediaMode === "auto" ? "✨" : "♫"}` : ""}
+                    {job.soundEffectAssetIds.length ? " · 🔊" : ""}
                   </span>
                 </span>
                 <span className="shrink-0 text-[10px] uppercase text-slate-500">{job.status}</span>

@@ -3,6 +3,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   real,
   serial,
   text,
@@ -57,6 +58,8 @@ export const jobs = pgTable(
       estimatedBpm: number | null;
       vibe: string;
     }>(),
+    /** none | manual | auto; library assets are linked in job_media_assets. */
+    mediaMode: text("media_mode").notNull().default("none"),
 
     analysisProvider: text("analysis_provider"),
     analysisModel: text("analysis_model"),
@@ -78,6 +81,53 @@ export const jobs = pgTable(
   (table) => [
     index("jobs_created_at_idx").on(table.createdAt),
     index("jobs_status_idx").on(table.status),
+  ],
+);
+
+export const mediaAssets = pgTable(
+  "media_assets",
+  {
+    id: text("id").primaryKey(),
+    category: text("category").notNull(), // music | sound_effect
+    name: text("name").notNull(),
+    fileName: text("file_name").notNull(),
+    contentType: text("content_type").notNull(),
+    objectKey: text("object_key").notNull().unique(),
+    fileSizeBytes: integer("file_size_bytes").notNull(),
+    durationSec: real("duration_sec").notNull(),
+    tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    analysis: jsonb("analysis").$type<{
+      durationSec: number;
+      averageDb: number | null;
+      peakTimesSec: number[];
+      estimatedBpm: number | null;
+      vibe: string;
+    }>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("media_assets_category_idx").on(table.category),
+    index("media_assets_created_at_idx").on(table.createdAt),
+  ],
+);
+
+export const jobMediaAssets = pgTable(
+  "job_media_assets",
+  {
+    jobId: text("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    assetId: text("asset_id")
+      .notNull()
+      .references(() => mediaAssets.id, { onDelete: "restrict" }),
+    role: text("role").notNull(), // music | sound_effect
+    sortOrder: integer("sort_order").notNull().default(0),
+  },
+  (table) => [
+    primaryKey({ columns: [table.jobId, table.assetId] }),
+    index("job_media_assets_job_idx").on(table.jobId),
+    index("job_media_assets_asset_idx").on(table.assetId),
   ],
 );
 
@@ -130,5 +180,6 @@ export const jobEvents = pgTable(
 );
 
 export type JobRow = typeof jobs.$inferSelect;
+export type MediaAssetRow = typeof mediaAssets.$inferSelect;
 export type ClipRow = typeof clips.$inferSelect;
 export type JobEventRow = typeof jobEvents.$inferSelect;

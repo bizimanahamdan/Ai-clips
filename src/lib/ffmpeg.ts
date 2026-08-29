@@ -341,6 +341,7 @@ export async function renderVerticalClip(options: {
   hasAudio: boolean;
   framingMode?: "crop" | "fit";
   music?: { input: string; startOffsetSec: number; volume?: number };
+  soundEffects?: Array<{ input: string; atSec?: number; volume?: number }>;
   onProgress?: RenderProgress;
 }): Promise<void> {
   const duration = Math.max(0.5, options.endSec - options.startSec);
@@ -365,30 +366,59 @@ export async function renderVerticalClip(options: {
     "-hide_banner", "-loglevel", "warning", "-stats", "-y",
     "-ss", options.startSec.toFixed(3), "-i", options.input,
   ];
+  let nextInputIndex = 1;
+  let musicInputIndex: number | null = null;
   if (options.music) {
+    musicInputIndex = nextInputIndex++;
     args.push(
       "-stream_loop", "-1",
       "-ss", Math.max(0, options.music.startOffsetSec).toFixed(3),
       "-i", options.music.input,
     );
   }
+  const effectInputs = (options.soundEffects ?? []).slice(0, 4).map((effect) => ({
+    ...effect,
+    inputIndex: nextInputIndex++,
+  }));
+  for (const effect of effectInputs) args.push("-i", effect.input);
   args.push("-t", duration.toFixed(3));
 
-  if (options.music) {
-    const volume = Math.max(0.03, Math.min(0.5, options.music.volume ?? 0.18));
-    const fadeOutStart = Math.max(0, duration - 1);
-    const audioFilters = [
-      `[0:v]${videoFilters.join(",")}[vout]`,
-      `[1:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${Math.min(0.8, duration / 3).toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration).toFixed(3)}[music]`,
-    ];
-    if (options.hasAudio) {
-      audioFilters.push(
-        "[music][0:a:0]sidechaincompress=threshold=0.025:ratio=8:attack=20:release=400[ducked]",
-        "[0:a:0][ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]",
-      );
-    } else {
-      audioFilters.push("[music]alimiter=limit=0.95[aout]");
+  const hasAddedAudio = musicInputIndex !== null || effectInputs.length > 0;
+  if (hasAddedAudio) {
+    const audioFilters = [`[0:v]${videoFilters.join(",")}[vout]`];
+    const mixInputs: string[] = [];
+    if (options.hasAudio && musicInputIndex !== null) {
+      audioFilters.push("[0:a:0]aresample=44100,asetpts=PTS-STARTPTS,asplit=2[speechmix][speechside]");
+      mixInputs.push("[speechmix]");
+    } else if (options.hasAudio) {
+      audioFilters.push("[0:a:0]aresample=44100,asetpts=PTS-STARTPTS[speechmix]");
+      mixInputs.push("[speechmix]");
     }
+    if (musicInputIndex !== null && options.music) {
+      const volume = Math.max(0.03, Math.min(0.5, options.music.volume ?? 0.18));
+      const fadeOutStart = Math.max(0, duration - 1);
+      audioFilters.push(
+        `[${musicInputIndex}:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${Math.min(0.8, duration / 3).toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration).toFixed(3)}[music]`,
+      );
+      if (options.hasAudio) {
+        audioFilters.push("[music][speechside]sidechaincompress=threshold=0.025:ratio=8:attack=20:release=400[ducked]");
+        mixInputs.push("[ducked]");
+      } else {
+        mixInputs.push("[music]");
+      }
+    }
+    effectInputs.forEach((effect, index) => {
+      const atSec = Math.max(0, Math.min(duration - 0.05, effect.atSec ?? 0));
+      const delayMs = Math.round(atSec * 1000);
+      const volume = Math.max(0.03, Math.min(1, effect.volume ?? 0.3));
+      audioFilters.push(
+        `[${effect.inputIndex}:a]aresample=44100,atrim=duration=${Math.max(0.05, duration - atSec).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${volume.toFixed(3)},apad,atrim=duration=${duration.toFixed(3)}[sfx${index}]`,
+      );
+      mixInputs.push(`[sfx${index}]`);
+    });
+    audioFilters.push(
+      `${mixInputs.join("")}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`,
+    );
     args.push("-filter_complex", audioFilters.join(";"), "-map", "[vout]", "-map", "[aout]");
   } else {
     args.push("-vf", videoFilters.join(","), "-map", "0:v:0");
@@ -396,7 +426,7 @@ export async function renderVerticalClip(options: {
     else args.push("-an");
   }
 
-  if (options.hasAudio || options.music) {
+  if (options.hasAudio || hasAddedAudio) {
     args.push("-c:a", "aac", "-b:a", `${options.audioBitrateK}k`, "-ar", "44100", "-ac", "2");
   }
 

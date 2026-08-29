@@ -54,6 +54,11 @@ export function clipObjectKey(jobId: string, fileName: string): string {
   return `jobs/${jobId}/clips/${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 }
 
+export function mediaLibraryObjectKey(assetId: string, fileName: string): string {
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "audio.bin";
+  return `media-library/${assetId}/${safeName}`;
+}
+
 export function pendingMusicObjectKey(fileName: string): string {
   const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-100) || "music.mp3";
   return `pending-music/${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeName}`;

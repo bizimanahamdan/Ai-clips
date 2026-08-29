@@ -13,6 +13,13 @@ import { clipFileName, createJobDir, removePath } from "./storage";
 import { clipObjectKey, uploadFileToR2 } from "./object-storage";
 import { acquireVideoSource } from "./video-source";
 import { acquireAndAnalyzeMusic, musicOffsetForClip } from "./music";
+import {
+  chooseMusicForClip,
+  chooseSoundEffectForClip,
+  downloadLibraryAssets,
+  getJobLibraryAssets,
+  normalizeMediaMode,
+} from "./media-library";
 import { normalizeOutputFormat, outputDimensions } from "./output-format";
 import { extractAndTranscribe } from "./transcribe";
 import { validateClips } from "./validate";
@@ -61,6 +68,8 @@ export async function runPipeline(jobId: string): Promise<void> {
   const ctx: Ctx = { jobId, workDir: "" };
   const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   if (!job) throw new AppError("not_found", `Job ${jobId} disappeared from the database.`);
+  const libraryAssets = await getJobLibraryAssets(jobId);
+  const mediaMode = normalizeMediaMode(job.mediaMode);
 
   try {
     await patchJob(ctx, {
@@ -240,6 +249,20 @@ export async function runPipeline(jobId: string): Promise<void> {
       validated.map((c) => `#${c.index + 1} ${c.startSec.toFixed(1)}-${c.endSec.toFixed(1)}s (${c.score}/100) ${c.title}`).join(" | "),
     );
 
+    const mediaSelections = validated.map((clip, index) => ({
+      music: chooseMusicForClip(libraryAssets, clip, index, mediaMode),
+      soundEffect: chooseSoundEffectForClip(libraryAssets, index),
+    }));
+    const requiredLibraryAssets = [...new Map(
+      mediaSelections.flatMap((item) => [item.music, item.soundEffect]).filter((item) => item !== null).map((item) => [item.id, item]),
+    ).values()];
+    const localLibraryFiles = requiredLibraryAssets.length
+      ? await downloadLibraryAssets(requiredLibraryAssets, ctx.workDir)
+      : new Map<string, string>();
+    if (requiredLibraryAssets.length) {
+      await log(ctx, "info", "selecting", `Using ${requiredLibraryAssets.length} reusable media library asset(s); saved upload analysis was reused.`);
+    }
+
     /* 7. Render ---------------------------------------------------------- */
     const outputFormat = normalizeOutputFormat(job.outputFormat);
     const dimensions = outputDimensions(outputFormat);
@@ -250,6 +273,7 @@ export async function runPipeline(jobId: string): Promise<void> {
 
     for (let index = 0; index < validated.length; index += 1) {
       const clip = validated[index];
+      const mediaSelection = mediaSelections[index];
       const clipId = `${jobId}-c${index + 1}`;
       const base = STAGE_WEIGHTS.rendering + (index / validated.length) * (STAGE_WEIGHTS.finalizing - STAGE_WEIGHTS.rendering - 1);
       const span = (STAGE_WEIGHTS.finalizing - STAGE_WEIGHTS.rendering - 1) / validated.length;
@@ -301,20 +325,33 @@ export async function runPipeline(jobId: string): Promise<void> {
             ).catch(() => undefined);
           },
         };
+        const libraryMusic = mediaSelection.music;
+        const savedMusicAnalysis = libraryMusic?.analysis ?? null;
+        const selectedMusic = libraryMusic
+          ? {
+              input: localLibraryFiles.get(libraryMusic.id) as string,
+              startOffsetSec: savedMusicAnalysis ? musicOffsetForClip(savedMusicAnalysis, index) : 0,
+              volume: savedMusicAnalysis?.vibe === "intense" ? 0.13 : 0.18,
+            }
+          : backgroundMusic
+            ? {
+                input: backgroundMusic.localPath,
+                startOffsetSec: musicOffsetForClip(backgroundMusic.analysis, index),
+                volume: backgroundMusic.analysis.vibe === "intense" ? 0.13 : 0.18,
+              }
+            : undefined;
+        const selectedEffect = mediaSelection.soundEffect
+          ? { input: localLibraryFiles.get(mediaSelection.soundEffect.id) as string, atSec: 0.12, volume: 0.32 }
+          : undefined;
         try {
           await renderVerticalClip({
             ...renderOptions,
-            music: backgroundMusic
-              ? {
-                  input: backgroundMusic.localPath,
-                  startOffsetSec: musicOffsetForClip(backgroundMusic.analysis, index),
-                  volume: backgroundMusic.analysis.vibe === "intense" ? 0.13 : 0.18,
-                }
-              : undefined,
+            music: selectedMusic,
+            soundEffects: selectedEffect ? [selectedEffect] : undefined,
           });
         } catch (error) {
-          if (!backgroundMusic) throw error;
-          await log(ctx, "warn", "rendering", `Music mix failed for clip ${index + 1}; retrying safely without music. ${(error as Error).message}`);
+          if (!selectedMusic && !selectedEffect) throw error;
+          await log(ctx, "warn", "rendering", `Library audio mix failed for clip ${index + 1}; retrying safely without added audio. ${(error as Error).message}`);
           await fsp.rm(outputPath, { force: true });
           await renderVerticalClip(renderOptions);
         }
