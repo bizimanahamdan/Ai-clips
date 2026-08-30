@@ -188,7 +188,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       throw new AppError(
         "missing_api_key",
         "No AI provider is configured for clip analysis.",
-        { detail: "Set GEMINI_API_KEY for direct Gemini analysis and/or configure OpenRouter or Groq fallback." },
+        { detail: "Set GEMINI_API_KEY plus GEMINI_TEXT_MODEL for direct Gemini analysis and/or configure OpenRouter or Groq fallback." },
       );
     }
     await setStage(ctx, "preparing_transcript", "Preparing timestamped transcript parts…", 55);

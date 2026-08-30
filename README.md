@@ -88,6 +88,7 @@ Required on the Render web service (all are server-only; never prefix them with 
 | `DATABASE_URL` | Render PostgreSQL internal connection URL |
 | `GROQ_API_KEY` | Groq key for Whisper transcription and analysis fallback |
 | `GEMINI_API_KEY` | Google AI Studio key for direct Gemini analysis (preferred for long videos) |
+| `GEMINI_TEXT_MODEL` | A Gemini model ID currently available to that API account |
 | `OPENROUTER_API_KEY` | OpenRouter analysis fallback key (optional) |
 | `R2_ACCOUNT_ID` | Cloudflare account ID |
 | `R2_ACCESS_KEY_ID` | R2 token access key ID |
@@ -115,23 +116,29 @@ See `.env.example` for every tuning variable. Secrets are only read by server mo
 
 ### AI analysis configuration
 
-The analysis model is separate from Whisper transcription. Direct Google Gemini is the preferred analysis provider, followed by OpenRouter and then Groq. The recommended direct model is `gemini-2.5-flash`. Each request uses structured JSON where supported, one controlled repair/transient retry, and automatic provider fallback.
+The analysis model is separate from Whisper transcription. Direct Google Gemini is preferred, followed by OpenRouter and then Groq. Gemini model availability differs by API account, so `GEMINI_TEXT_MODEL` is required and must be set to a model actually listed for that account; the example below is not assumed valid by the application. A model 404 or OpenRouter credit 402 disables that provider for the rest of the current job and immediately continues fallback.
 
 ```env
 GEMINI_API_KEY=
-GEMINI_TEXT_MODEL=gemini-2.5-flash
+GEMINI_TEXT_MODEL=gemini-3.6-flash # verify against your Google account
 GROQ_TEXT_MODEL=openai/gpt-oss-20b
 OPENROUTER_TEXT_MODEL=google/gemini-2.5-flash
 ANALYSIS_PROVIDERS=gemini,openrouter,groq
 ANALYSIS_MAX_RETRIES=1
-ANALYSIS_CANDIDATE_MULTIPLIER=3
-ANALYSIS_TRANSCRIPT_MAX_CHARS=18000
-ANALYSIS_CHUNK_MAX_SECONDS=720
+ANALYSIS_MAX_INPUT_TOKENS=4500
+ANALYSIS_PROMPT_RESERVE_TOKENS=1000
+ANALYSIS_DISCOVERY_OUTPUT_TOKENS=1200
+ANALYSIS_SELECTION_OUTPUT_TOKENS=700
+ANALYSIS_GROQ_TOTAL_TOKENS=6500
+ANALYSIS_TRANSCRIPT_MAX_CHARS=12000
+ANALYSIS_CHUNK_MAX_SECONDS=600
 ANALYSIS_CHUNK_OVERLAP_SEC=30
-ANALYSIS_GROQ_SAFE_CHARS=20000
+ANALYSIS_GROQ_SAFE_CHARS=14000
 ```
 
-Timestamped transcript segments are split by both character budget and time window with overlap. Discovery runs independently on every part; long videos then receive a second, compact global candidate-ranking pass. The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. Groq never receives a prompt above its configured conservative character limit. Video data is never sent to an analysis model.
+Timestamped transcript segments are split primarily by a conservative token estimate, with character/time limits as secondary guards and a small duration-aware overlap. The default 4,500-token input ceiling reserves 1,000 tokens for instructions, leaving roughly 3,500 estimated transcript tokens per discovery part. Discovery runs independently on every part; long videos then receive a compact global candidate-ranking pass. Output is capped at 1,200 tokens for discovery and 700 for ranking instead of 4,096.
+
+The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. Groq is excluded before a request would exceed its conservative total budget; an unexpected Groq 413 receives one retry using a much smaller segment-boundary section. HTTP 429 honors `Retry-After` with bounded exponential backoff. Failed parts do not discard candidates from successful parts, and the job fails analysis only when no usable candidates survive. Video data is never sent to an analysis model.
 
 ## Database migrations
 

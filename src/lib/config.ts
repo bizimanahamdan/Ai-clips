@@ -65,7 +65,9 @@ export const config = {
   /** Clip analysis -------------------------------------------------------- */
   geminiApiKey: process.env.GEMINI_API_KEY?.trim() || "",
   geminiBaseUrl: str("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
-  geminiTextModel: str("GEMINI_TEXT_MODEL", "gemini-2.5-flash"),
+  // Gemini model availability varies by API account. Require an explicit model
+  // instead of silently sending requests to a stale hardcoded default.
+  geminiTextModel: process.env.GEMINI_TEXT_MODEL?.trim() || "",
   openrouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || "",
   openrouterBaseUrl: str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
   // Keep model IDs environment-configurable: account/model access can differ.
@@ -80,11 +82,17 @@ export const config = {
   /** One controlled retry for transient or repairable provider failures. */
   analysisMaxRetries: num("ANALYSIS_MAX_RETRIES", 1),
   analysisCandidateMultiplier: num("ANALYSIS_CANDIDATE_MULTIPLIER", 3),
-  /** Per-request transcript bound; long transcripts are split, never truncated wholesale. */
-  analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 18_000),
+  /** Conservative request budgets. Token estimates intentionally err high. */
+  analysisMaxInputTokens: num("ANALYSIS_MAX_INPUT_TOKENS", 4_500),
+  analysisPromptReserveTokens: num("ANALYSIS_PROMPT_RESERVE_TOKENS", 1_000),
+  analysisDiscoveryOutputTokens: num("ANALYSIS_DISCOVERY_OUTPUT_TOKENS", 1_200),
+  analysisSelectionOutputTokens: num("ANALYSIS_SELECTION_OUTPUT_TOKENS", 700),
+  analysisGroqTotalTokens: num("ANALYSIS_GROQ_TOTAL_TOKENS", 6_500),
+  /** Legacy character bound remains a secondary guard for existing deployments. */
+  analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 12_000),
   analysisChunkOverlapSec: num("ANALYSIS_CHUNK_OVERLAP_SEC", 30),
-  analysisChunkMaxSec: num("ANALYSIS_CHUNK_MAX_SECONDS", 720),
-  analysisGroqSafeChars: num("ANALYSIS_GROQ_SAFE_CHARS", 20_000),
+  analysisChunkMaxSec: num("ANALYSIS_CHUNK_MAX_SECONDS", 600),
+  analysisGroqSafeChars: num("ANALYSIS_GROQ_SAFE_CHARS", 14_000),
 
   /** Output --------------------------------------------------------------- */
   targetWidth: num("TARGET_WIDTH", 1080),
@@ -118,9 +126,9 @@ export function providersConfigured(): {
   order: AnalysisProvider[];
 } {
   const configured = {
-    gemini: config.geminiApiKey.length > 0,
-    groq: transcriptionConfigured(),
-    openrouter: config.openrouterApiKey.length > 0,
+    gemini: config.geminiApiKey.length > 0 && config.geminiTextModel.length > 0,
+    groq: transcriptionConfigured() && config.groqTextModel.length > 0,
+    openrouter: config.openrouterApiKey.length > 0 && config.openrouterTextModel.length > 0,
   };
   // Keep fallback deterministic even when an older deployment still has
   // ANALYSIS_PROVIDERS=groq,openrouter. A configured direct Gemini key is

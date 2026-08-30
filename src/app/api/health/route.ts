@@ -33,7 +33,7 @@ export async function GET() {
   try {
     const providers = providersConfigured();
     checks.providers = {
-      gemini: providers.gemini ? "configured" : "missing GEMINI_API_KEY",
+      gemini: providers.gemini ? "configured" : "missing GEMINI_API_KEY or GEMINI_TEXT_MODEL",
       groq: providers.groq ? "configured" : "missing GROQ_API_KEY",
       openrouter: providers.openrouter ? "configured" : "missing OPENROUTER_API_KEY",
       order: providers.order,

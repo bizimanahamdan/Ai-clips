@@ -39,8 +39,33 @@ export type TranscriptAnalysisChunk = {
   startSec: number;
   endSec: number;
   characterCount: number;
+  estimatedTokens: number;
   block: string;
 };
+
+/** Conservative, dependency-free estimate suitable for request budgeting. */
+export function estimateTokens(value: string): number {
+  const clean = value.trim();
+  if (!clean) return 0;
+  const nonAsciiCharacters = (clean.match(/[^\x00-\x7F]/g) ?? []).length;
+  const asciiCharacters = clean.length - nonAsciiCharacters;
+  // Non-Latin scripts can approach one token per character; English prose is
+  // deliberately estimated more conservatively than the usual ~4 chars/token.
+  const characterEstimate = Math.ceil(asciiCharacters / 3 + nonAsciiCharacters);
+  const wordEstimate = Math.ceil(clean.split(/\s+/).length * 1.35);
+  return Math.max(characterEstimate, wordEstimate);
+}
+
+function truncateToTokenBudget(value: string, tokenBudget: number, characterBudget: number): string {
+  let low = 0;
+  let high = Math.min(value.length, characterBudget);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (estimateTokens(value.slice(0, middle)) <= tokenBudget) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low).trimEnd();
+}
 
 function formatClock(seconds: number): string {
   const safe = Math.max(0, seconds);
@@ -80,51 +105,69 @@ export function splitTranscriptForAnalysis(
   maxChars = config.analysisTranscriptMaxChars,
   overlapSec = config.analysisChunkOverlapSec,
   maxChunkSec = config.analysisChunkMaxSec,
+  maxInputTokens = config.analysisMaxInputTokens,
+  promptReserveTokens = config.analysisPromptReserveTokens,
 ): TranscriptAnalysisChunk[] {
+  const safeInputBudget = Math.max(2_000, Math.min(6_000, Math.floor(maxInputTokens)));
+  const safePromptReserve = Math.max(500, Math.min(safeInputBudget - 500, Math.floor(promptReserveTokens)));
+  const transcriptTokenBudget = safeInputBudget - safePromptReserve;
+  // Secondary hard cap protects deployments carrying old 18k/90k settings.
+  const safeMaxChars = Math.max(4_000, Math.min(12_000, Math.round(maxChars)));
   if (!transcript.segments.length) {
-    const block = transcript.text.trim();
+    const source = transcript.text.trim();
+    const block = truncateToTokenBudget(source, transcriptTokenBudget, safeMaxChars);
     return block ? [{
       index: 0,
       startSegment: 0,
       endSegment: 0,
       startSec: 0,
       endSec: transcript.durationSec,
-      characterCount: Math.min(block.length, maxChars),
-      block: block.slice(0, maxChars),
+      characterCount: block.length,
+      estimatedTokens: estimateTokens(block),
+      block,
     }] : [];
   }
-  // Hard cap protects deployments that still carry the old 90k setting.
-  const safeMaxChars = Math.max(4_000, Math.min(24_000, Math.round(maxChars)));
   const chunks: TranscriptAnalysisChunk[] = [];
   let start = 0;
   while (start < transcript.segments.length) {
     const lines: string[] = [];
     let characters = 0;
+    let estimatedWords = 0;
+    let nonAsciiCharacters = 0;
     let end = start;
     while (end < transcript.segments.length) {
       const line = segmentLine(transcript, end);
+      const nextCharacters = characters + line.length + (lines.length ? 1 : 0);
+      const nextWords = estimatedWords + line.trim().split(/\s+/).length;
+      const nextNonAscii = nonAsciiCharacters + (line.match(/[^\x00-\x7F]/g) ?? []).length;
+      const nextAscii = nextCharacters - nextNonAscii;
+      const nextTokens = Math.max(Math.ceil(nextAscii / 3 + nextNonAscii), Math.ceil(nextWords * 1.35));
       const exceedsTimeWindow = lines.length > 0 && transcript.segments[end].end - transcript.segments[start].start > maxChunkSec;
-      if (lines.length && (characters + line.length + 1 > safeMaxChars || exceedsTimeWindow)) break;
+      if (lines.length && (nextCharacters > safeMaxChars || nextTokens > transcriptTokenBudget || exceedsTimeWindow)) break;
       lines.push(line);
-      characters += line.length + 1;
+      characters = nextCharacters;
+      estimatedWords = nextWords;
+      nonAsciiCharacters = nextNonAscii;
       end += 1;
     }
-    // Always make progress even if one unusually large segment exceeds budget.
+    // Always make progress if Whisper supplied one unusually large segment.
     if (end === start) {
-      lines.push(segmentLine(transcript, start).slice(0, safeMaxChars));
+      lines.push(truncateToTokenBudget(segmentLine(transcript, start), transcriptTokenBudget, safeMaxChars));
       characters = lines[0].length;
       end = start + 1;
     }
     const first = transcript.segments[start];
     const last = transcript.segments[end - 1];
+    const block = lines.join("\n");
     chunks.push({
       index: chunks.length,
       startSegment: start,
       endSegment: end - 1,
       startSec: first.start,
       endSec: last.end,
-      characterCount: characters,
-      block: lines.join("\n"),
+      characterCount: block.length,
+      estimatedTokens: estimateTokens(block),
+      block,
     });
     if (end >= transcript.segments.length) break;
     const overlapStartTime = Math.max(first.start, last.end - Math.max(0, overlapSec));
@@ -166,7 +209,9 @@ export function buildUserPrompt(options: {
     options.preferredVibes?.length
       ? `Weak tie-breaker only: when quality is equal, prefer content compatible with these optional music tags: ${options.preferredVibes.join(", ")}. Never sacrifice clip quality for music.`
       : "",
-    "JSON only. title must be concise (max 80 chars); hook max 60 chars; reason max 240 chars.",
+    "Return ONLY valid JSON: no markdown, code fences, commentary, or explanations outside JSON.",
+    "Timestamp values, when requested, must be numeric seconds. S indexes are mapped server-side to exact numeric transcript timestamps.",
+    "title must be concise (max 80 chars); hook max 60 chars; reason max 240 chars.",
     options.useSegmentIndexes === false
       ? '{"clips":[{"startSec":12.5,"endSec":48.2,"title":"Concise title","hook":"Short hook","reason":"Brief concrete rationale","score":87}]}'
       : '{"clips":[{"startSegment":42,"endSegment":58,"title":"Concise title","hook":"Short hook","reason":"Brief concrete rationale","score":92}]}',
@@ -236,12 +281,22 @@ function providerModel(provider: AnalysisProvider): string {
   return provider === "openrouter" ? config.openrouterTextModel : config.groqTextModel;
 }
 
+function retryAfterMilliseconds(response: Response): number | undefined {
+  const value = response.headers.get("retry-after")?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
 async function callOpenAiCompatible(options: {
   provider: "groq" | "openrouter";
   system: string;
   user: string;
   mode: ResponseMode;
   schema: Record<string, unknown>;
+  outputTokenLimit: number;
   signal: AbortSignal;
 }): Promise<string> {
   const isGroq = options.provider === "groq";
@@ -250,7 +305,7 @@ async function callOpenAiCompatible(options: {
   const body = {
     model: providerModel(options.provider),
     temperature: 0.2,
-    max_tokens: 4096,
+    max_tokens: options.outputTokenLimit,
     messages: [{ role: "system", content: options.system }, { role: "user", content: options.user }],
     response_format: options.mode === "json_schema"
       ? { type: "json_schema", json_schema: { name: "analysis_result", strict: true, schema: options.schema } }
@@ -278,7 +333,12 @@ async function callOpenAiCompatible(options: {
         retryable: true,
       });
     }
-    throw describeHttpStatus(response.status, `${isGroq ? "Groq" : "OpenRouter"} analysis`, text);
+    throw describeHttpStatus(
+      response.status,
+      `${isGroq ? "Groq" : "OpenRouter"} analysis`,
+      text,
+      retryAfterMilliseconds(response),
+    );
   }
   const parsed = await response.json() as { choices?: Array<{ message?: { content?: string | null } }> };
   const content = parsed.choices?.[0]?.message?.content;
@@ -303,6 +363,7 @@ async function callGemini(options: {
   system: string;
   user: string;
   schema: Record<string, unknown>;
+  outputTokenLimit: number;
   signal: AbortSignal;
 }): Promise<string> {
   const endpoint = `${config.geminiBaseUrl}/models/${encodeURIComponent(config.geminiTextModel)}:generateContent`;
@@ -314,7 +375,7 @@ async function callGemini(options: {
       contents: [{ role: "user", parts: [{ text: options.user }] }],
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 4096,
+        maxOutputTokens: options.outputTokenLimit,
         responseMimeType: "application/json",
         responseSchema: toGeminiSchema(options.schema),
       },
@@ -323,7 +384,7 @@ async function callGemini(options: {
   });
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    throw describeHttpStatus(response.status, "Gemini analysis", text);
+    throw describeHttpStatus(response.status, "Gemini analysis", text, retryAfterMilliseconds(response));
   }
   const parsed = await response.json() as {
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
@@ -345,6 +406,7 @@ async function callProvider(options: {
   user: string;
   mode: ResponseMode;
   schema: Record<string, unknown>;
+  outputTokenLimit: number;
 }): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.analysisTimeoutSec * 1000);
@@ -535,7 +597,7 @@ export function normaliseClips(value: unknown, transcript: Transcript, durationS
       startSec = parseTimestamp(clip.startSec);
       endSec = parseTimestamp(clip.endSec);
     }
-    if (startSec === null || endSec === null || endSec <= startSec || startSec < 0 || endSec > durationSec + 0.1) {
+    if (startSec === null || endSec === null || endSec <= startSec || startSec < 0 || endSec > durationSec) {
       issues.push(`candidate ${index + 1}: timestamps outside source duration`);
       return;
     }
@@ -559,52 +621,113 @@ export function normaliseClips(value: unknown, transcript: Transcript, durationS
   return valid;
 }
 
-function configuredProviders(promptChars: number): AnalysisProvider[] {
+function configuredProviders(prompt: string, outputTokenLimit: number): AnalysisProvider[] {
+  const inputTokens = estimateTokens(`${SYSTEM_PROMPT}\n${prompt}`);
   return providersConfigured().order.filter((provider) => {
-    if (provider === "groq" && promptChars > config.analysisGroqSafeChars) {
-      console.info(`[analysis] skipping Groq for ${promptChars} characters (safe limit ${config.analysisGroqSafeChars})`);
+    if (provider === "groq" && (
+      prompt.length > config.analysisGroqSafeChars
+      || inputTokens + outputTokenLimit > config.analysisGroqTotalTokens
+    )) {
+      console.info(
+        `[analysis] provider=groq skipped input_estimated_tokens=${inputTokens} output_token_limit=${outputTokenLimit} safe_total=${config.analysisGroqTotalTokens}`,
+      );
       return false;
     }
     return true;
   });
 }
 
+function reduceTranscriptPrompt(prompt: string, chunk = 0): string {
+  const marker = "\nTRANSCRIPT\n";
+  const markerIndex = prompt.indexOf(marker);
+  if (markerIndex < 0) return prompt;
+  const prefix = prompt.slice(0, markerIndex + marker.length);
+  const lines = prompt.slice(markerIndex + marker.length).split("\n").filter(Boolean);
+  if (lines.length < 2) return prompt;
+  const keep = Math.max(1, Math.floor(lines.length * 0.25));
+  // Alternate retained portions across chunks so an emergency Groq retry does
+  // not always bias toward the beginning of the full video.
+  const reduced = chunk % 2 === 0 ? lines.slice(0, keep) : lines.slice(-keep);
+  return `${prefix}${reduced.join("\n")}`;
+}
+
 async function runWithFallback(options: {
   user: string;
   schema: Record<string, unknown>;
-  parse: (content: string) => unknown;
+  parse: (content: string, requestPrompt: string) => unknown;
   phase: "discovery" | "selection";
   chunk?: number;
   attempts: AnalysisAttempt[];
+  unavailableProviders: Set<AnalysisProvider>;
 }): Promise<{ value: unknown; provider: AnalysisProvider; model: string; raw: string }> {
-  const providers = configuredProviders(options.user.length);
-  if (!providers.length) throw new AppError("missing_api_key", "No suitable AI analysis provider is configured.", { status: 503 });
+  const configuredOutputLimit = options.phase === "discovery"
+    ? config.analysisDiscoveryOutputTokens
+    : config.analysisSelectionOutputTokens;
+  const outputTokenLimit = Math.max(256, Math.min(2_000, Math.round(configuredOutputLimit)));
+  const providers = configuredProviders(options.user, outputTokenLimit)
+    .filter((provider) => !options.unavailableProviders.has(provider));
+  if (!providers.length) {
+    throw new AppError(
+      "invalid_ai_output",
+      options.unavailableProviders.size
+        ? "All suitable AI providers are unavailable for this job."
+        : "No suitable AI analysis provider is configured for this request size.",
+      { status: 503 },
+    );
+  }
   for (const provider of providers) {
     const model = providerModel(provider);
-    const maxAttempts = Math.max(1, Math.min(2, config.analysisMaxRetries + 1));
+    const maxAttempts = Math.max(1, Math.min(2, Math.floor(config.analysisMaxRetries) + 1));
     let correction = "";
+    let providerUser = options.user;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const user = correction ? `${providerUser}\nCORRECTION: ${correction}` : providerUser;
+      const inputTokens = estimateTokens(`${SYSTEM_PROMPT}\n${user}`);
+      console.info(
+        `[analysis] provider=${provider} model=${model} chunk=${options.chunk !== undefined ? `${options.chunk + 1}` : "ranking"} input_estimated_tokens=${inputTokens} output_token_limit=${outputTokenLimit} retry=${attempt - 1}`,
+      );
       try {
-        const user = correction ? `${options.user}\nCORRECTION: ${correction}` : options.user;
         const raw = await callProvider({
           provider,
           system: SYSTEM_PROMPT,
           user,
           mode: attempt === 1 ? "json_schema" : "json_object",
           schema: options.schema,
+          outputTokenLimit,
         });
-        const value = options.parse(raw);
+        const value = options.parse(raw, user);
         options.attempts.push({ provider, model, attempt, outcome: "succeeded", detail: "valid response", phase: options.phase, chunk: options.chunk });
         return { value, provider, model, raw };
       } catch (error) {
         const appError = error instanceof AppError ? error : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
         const detail = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 300)}` : ""}`;
         options.attempts.push({ provider, model, attempt, outcome: "failed", detail, phase: options.phase, chunk: options.chunk });
-        console.warn(`[analysis] ${options.phase}${options.chunk !== undefined ? ` chunk ${options.chunk + 1}` : ""} ${provider}/${model} attempt ${attempt} failed: ${detail}`);
-        correction = "Return only complete JSON. Keep title concise, hook <= 60 chars, reason <= 240 chars, and use only supplied IDs/boundaries.";
+        console.warn(`[analysis] provider=${provider} model=${model} chunk=${options.chunk !== undefined ? options.chunk + 1 : "ranking"} retry=${attempt - 1} failed: ${detail}`);
+        if ([401, 402, 403, 404].includes(appError.providerStatus ?? 0)) {
+          options.unavailableProviders.add(provider);
+          console.warn(`[analysis] provider=${provider} model=${model} unavailable for the remainder of this job; continuing with fallback providers`);
+        }
+
+        const groqOversizeRetry = provider === "groq" && appError.providerStatus === 413 && attempt === 1 && options.phase === "discovery";
+        if (groqOversizeRetry) {
+          providerUser = reduceTranscriptPrompt(options.user, options.chunk ?? 0);
+          correction = "Return only valid JSON for the smaller transcript section below.";
+          console.warn(`[analysis] provider=groq model=${model} chunk=${(options.chunk ?? 0) + 1} HTTP 413; retrying once with input_estimated_tokens=${estimateTokens(providerUser)}`);
+        } else {
+          correction = "Return ONLY complete valid JSON, with no markdown or explanation. Keep title <= 80 chars, hook <= 60 chars, reason <= 240 chars, and use only supplied IDs/boundaries.";
+        }
+
         const transient = appError.retryable || appError.kind === "rate_limited";
-        if (!transient || attempt >= maxAttempts) break;
-        if (provider === "gemini") await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+        const retryAfterTooLong = appError.providerStatus === 429 && (appError.retryAfterMs ?? 0) > 60_000;
+        if (retryAfterTooLong) {
+          console.warn(`[analysis] provider=${provider} retry-after=${appError.retryAfterMs}ms is too long for an inline retry; continuing fallback`);
+        }
+        if ((!transient && !groqOversizeRetry) || retryAfterTooLong || attempt >= maxAttempts) break;
+        const exponentialDelay = Math.min(30_000, 750 * (2 ** (attempt - 1)));
+        const delay = appError.providerStatus === 429
+          ? Math.max(exponentialDelay, appError.retryAfterMs ?? 0)
+          : provider === "gemini" ? exponentialDelay : 0;
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
@@ -658,6 +781,10 @@ export async function analyseTranscript(options: {
   const chunks = splitTranscriptForAnalysis(options.transcript, config.analysisTranscriptMaxChars, chunkOverlapSec);
   if (!chunks.length) throw new AppError("invalid_ai_output", "Transcript is empty, so no clip analysis is possible.");
   const configured = providersConfigured();
+  if (config.geminiApiKey && !config.geminiTextModel) {
+    console.warn("[analysis] provider=gemini skipped: GEMINI_TEXT_MODEL is not configured");
+  }
+  console.info(`[analysis] provider_priority=${configured.order.map((provider) => `${provider}/${providerModel(provider)}`).join(" -> ") || "none"}`);
   if (!configured.order.length) {
     throw new AppError("missing_api_key", "No AI analysis provider is configured.", {
       status: 503,
@@ -668,6 +795,7 @@ export async function analyseTranscript(options: {
   const perChunk = Math.min(6, Math.max(3, Math.ceil(targetCandidates / chunks.length) + 1));
   const preferredVibes = [...new Set((options.preferredVibes ?? []).map((tag) => tag.trim()).filter(Boolean))].slice(0, 12);
   const attempts: AnalysisAttempt[] = [];
+  const unavailableProviders = new Set<AnalysisProvider>();
   const candidates: ClipCandidate[] = [];
   let lastProvider = configured.order[0];
   let lastModel = providerModel(lastProvider);
@@ -677,7 +805,7 @@ export async function analyseTranscript(options: {
   console.info(`[analysis] prepared ${chunks.length} transcript chunk(s), ${options.transcript.segments.length} segments`);
   for (const chunk of chunks) {
     await options.onProgress?.({ phase: "discovery", completed: chunk.index, total: chunks.length, message: `Analyzing part ${chunk.index + 1} of ${chunks.length}…` });
-    console.info(`[analysis] analyzing chunk ${chunk.index + 1}/${chunks.length}, segments ${chunk.startSegment}-${chunk.endSegment}, chars=${chunk.characterCount}`);
+    console.info(`[analysis] chunk=${chunk.index + 1}/${chunks.length} segments=${chunk.startSegment}-${chunk.endSegment} transcript_estimated_tokens=${chunk.estimatedTokens} chars=${chunk.characterCount}`);
     const prompt = buildUserPrompt({
       transcriptBlock: chunk.block,
       durationSec: options.durationSec,
@@ -693,13 +821,18 @@ export async function analyseTranscript(options: {
       const result = await runWithFallback({
         user: prompt,
         schema: clipJsonSchema(options.transcript.segments.length > 0),
-        parse: (raw) => {
+        parse: (raw, requestPrompt) => {
           const parsed = normaliseClips(extractJson(raw), options.transcript, options.durationSec);
+          const suppliedIndexes = [...requestPrompt.matchAll(/\[S(\d+)/g)].map((match) => Number(match[1]));
+          const suppliedStart = suppliedIndexes.length ? Math.min(...suppliedIndexes) : chunk.startSegment;
+          const suppliedEnd = suppliedIndexes.length ? Math.max(...suppliedIndexes) : chunk.endSegment;
+          const suppliedStartSec = options.transcript.segments[suppliedStart]?.start ?? chunk.startSec;
+          const suppliedEndSec = options.transcript.segments[suppliedEnd]?.end ?? chunk.endSec;
           const insideChunk = parsed.filter((candidate) => {
             if (candidate.startSegment !== undefined && candidate.endSegment !== undefined) {
-              return candidate.startSegment >= chunk.startSegment && candidate.endSegment <= chunk.endSegment;
+              return candidate.startSegment >= suppliedStart && candidate.endSegment <= suppliedEnd;
             }
-            return candidate.startSec >= chunk.startSec - 0.1 && candidate.endSec <= chunk.endSec + 0.1;
+            return candidate.startSec >= suppliedStartSec && candidate.endSec <= suppliedEndSec;
           });
           if (!insideChunk.length) {
             throw new AppError("invalid_ai_output", "Provider selected boundaries outside the supplied transcript part.", { retryable: true });
@@ -709,6 +842,7 @@ export async function analyseTranscript(options: {
         phase: "discovery",
         chunk: chunk.index,
         attempts,
+        unavailableProviders,
       });
       const found = result.value as ClipCandidate[];
       candidates.push(...found);
@@ -741,6 +875,7 @@ export async function analyseTranscript(options: {
         parse: (raw) => SelectionSchema.parse(extractJson(raw)),
         phase: "selection",
         attempts,
+        unavailableProviders,
       });
       const selection = result.value as z.infer<typeof SelectionSchema>;
       const selectedIds = new Set<number>();
