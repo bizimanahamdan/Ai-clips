@@ -148,8 +148,14 @@ export async function downloadObjectToFile(key: string, target: string): Promise
     await pipeline(result.Body as Readable, createWriteStream(target));
   } catch (error) {
     await fsp.rm(target, { force: true });
+    if (isMissingObjectError(error)) {
+      throw new AppError("source_object_missing", "The persisted source video does not exist in Cloudflare R2.", {
+        detail: `sourceObjectKey=${key}`,
+        status: 410,
+      });
+    }
     throw new AppError("download_failed", "Could not restore the source video from Cloudflare R2.", {
-      detail: (error as Error).message,
+      detail: `sourceObjectKey=${key}; ${(error as Error).message}`,
       status: 502,
     });
   }
@@ -202,8 +208,19 @@ export async function objectExists(key: string): Promise<boolean> {
 }
 
 export async function deleteObject(key: string, reason = "unspecified"): Promise<void> {
-  await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
-  console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=deleted reason=${reason}`);
+  try {
+    await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+    console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=deleted reason=${reason}`);
+  } catch (error) {
+    // S3 DeleteObject is normally idempotent; tolerate providers that surface
+    // an explicit missing-key response so cleanup/retry can safely run again.
+    if (isMissingObjectError(error)) {
+      console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=already-missing reason=${reason}`);
+      return;
+    }
+    console.error(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=delete-failed reason=${reason} error=${(error as Error).message}`);
+    throw error;
+  }
 }
 
 export async function deleteObjects(

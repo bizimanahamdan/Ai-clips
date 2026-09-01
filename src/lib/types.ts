@@ -67,7 +67,7 @@ export type AnalysisCheckpoint = {
   updatedAt: string;
 };
 
-export type JobStatus = "queued" | "processing" | "completed" | "failed" | "partial";
+export type JobStatus = "queued" | "processing" | "completed" | "failed" | "partial" | "cleanup_pending";
 
 export type Stage =
   | "queued"

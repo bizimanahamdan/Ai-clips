@@ -55,53 +55,38 @@ async function boot(): Promise<void> {
 
   console.log(`[startup] PostgreSQL, FFmpeg, and R2 bucket ${config.r2BucketName} are ready; temp=${config.storageDir}`);
   const interrupted = await db
-    .select({ id: jobs.id, sourceType: jobs.sourceType, sourceObjectKey: jobs.sourceObjectKey, status: jobs.status })
+    .select({ id: jobs.id, sourceType: jobs.sourceType, sourceObjectKey: jobs.sourceObjectKey, fileSizeBytes: jobs.fileSizeBytes, stage: jobs.stage, status: jobs.status })
     .from(jobs)
-    .where(inArray(jobs.status, ["queued", "processing"]))
+    .where(inArray(jobs.status, ["queued", "processing", "cleanup_pending"]))
     .orderBy(asc(jobs.createdAt));
 
+  let cleanupInterrupted = false;
   for (const job of interrupted) {
-    if (job.status === "queued") {
-      enqueue(job.id);
+    if (job.status === "cleanup_pending") {
+      // A restart may interrupt retention cleanup between its R2 and database
+      // steps. Return it to completed so the idempotent cleanup pass can retry.
+      await db.update(jobs).set({ status: "completed", updatedAt: new Date() }).where(eq(jobs.id, job.id));
+      cleanupInterrupted = true;
+      console.warn(`[startup recovery] job=${job.id} priorStage=cleanup_pending action=restore-completed-for-cleanup-retry`);
       continue;
     }
-    // A URL can be downloaded again; an upload can resume only from its exact durable key.
-    const remoteSource = ["direct_url", "dropbox", "google_drive", "url"].includes(job.sourceType);
     const sourceMetadata = job.sourceObjectKey ? await headObject(job.sourceObjectKey) : null;
-    if (job.sourceObjectKey) {
-      console.info(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} exists=${sourceMetadata?.exists ?? false} action=startup-recovery`);
-    }
-    const sourceAlive = remoteSource || sourceMetadata?.exists === true;
-    if (sourceAlive) {
-      // Durable source survived the restart: requeue from the beginning.
-      await db
-        .update(jobs)
-        .set({
-          status: "queued",
-          stage: "queued",
-          stageDetail: "Resuming after server restart",
-          progress: 0,
-          error: null,
-        })
-        .where(eq(jobs.id, job.id));
-      await db.insert(jobEvents).values({
-        jobId: job.id,
-        level: "warn",
-        stage: "recovery",
-        message: "Server restarted during processing. Job was re-queued from the beginning.",
-      });
-      enqueue(job.id);
-    } else {
+    console.info(`[startup recovery] job=${job.id} priorStage=${job.stage} sourceObjectKey=${job.sourceObjectKey ?? "none"} bucket=${config.r2BucketName} exists=${sourceMetadata?.exists ?? false}`);
+    const durableSourceMissing = job.sourceType === "upload"
+      ? !job.sourceObjectKey || sourceMetadata?.exists !== true
+      : Boolean(job.sourceObjectKey && job.fileSizeBytes !== null && sourceMetadata?.exists !== true);
+    if (durableSourceMissing) {
       await db
         .update(jobs)
         .set({
           status: "failed",
           stage: "failed",
-          stageDetail: "Interrupted by a server restart — temporary files were lost.",
+          stageDetail: "Persisted source object is missing from Cloudflare R2.",
           error: {
-            kind: "interrupted",
-            message: "Processing was interrupted by a server restart. Please run the job again.",
-            stage: "processing",
+            kind: "source_object_missing",
+            message: "The persisted source object is missing from Cloudflare R2.",
+            detail: `job=${job.id} stage=${job.stage} sourceObjectKey=${job.sourceObjectKey ?? "none"}`,
+            stage: job.stage,
           },
           finishedAt: new Date(),
           expiresAt: null,
@@ -111,11 +96,32 @@ async function boot(): Promise<void> {
         jobId: job.id,
         level: "error",
         stage: "recovery",
-        message: "Server restarted during processing and the temporary files were gone, so the job was marked failed.",
+        message: `SOURCE_OBJECT_MISSING: sourceObjectKey=${job.sourceObjectKey ?? "none"}, priorStage=${job.stage}`,
+      });
+      continue;
+    }
+    if (job.status === "processing") {
+      await db
+        .update(jobs)
+        .set({
+          status: "queued",
+          stage: "queued",
+          stageDetail: `Resuming saved checkpoints after restart (previous stage: ${job.stage})`,
+          progress: 0,
+          error: null,
+        })
+        .where(eq(jobs.id, job.id));
+      await db.insert(jobEvents).values({
+        jobId: job.id,
+        level: "warn",
+        stage: "recovery",
+        message: `Server restarted during ${job.stage}; resuming from persisted checkpoints with sourceObjectKey=${job.sourceObjectKey ?? "none"}.`,
       });
     }
+    enqueue(job.id);
   }
 
+  if (cleanupInterrupted) await runCleanup();
   startCleanupScheduler();
 }
 
@@ -216,24 +222,35 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
     return true;
   });
 
-  const ids = removable.map((job) => job.id);
-  if (ids.length) {
-    const sources = await db
-      .select({ key: jobs.sourceObjectKey, musicKey: jobs.musicObjectKey })
-      .from(jobs)
-      .where(inArray(jobs.id, ids));
+  const removedIds: string[] = [];
+  for (const removableJob of removable) {
+    // Atomically claim only a still-completed job. This closes the race where
+    // manual retry could make a job active after the cleanup query.
+    const claimed = await db
+      .update(jobs)
+      .set({ status: "cleanup_pending", updatedAt: new Date() })
+      .where(and(eq(jobs.id, removableJob.id), eq(jobs.status, "completed")))
+      .returning({ id: jobs.id, sourceKey: jobs.sourceObjectKey, musicKey: jobs.musicObjectKey });
+    if (!claimed.length) continue;
     const storedClips = await db
       .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
       .from(clips)
-      .where(inArray(clips.jobId, ids));
-    const expiredObjectKeys = [
-      ...sources.flatMap((item) => [item.key, item.musicKey]),
+      .where(eq(clips.jobId, removableJob.id));
+    const outputObjectKeys = [
+      claimed[0].musicKey,
       ...storedClips.flatMap((item) => [item.key, item.posterKey]),
     ];
-    // Remove authoritative database references first. If an R2 delete then
-    // fails, it leaves an orphan object rather than a live job with NoSuchKey.
-    await db.delete(jobs).where(inArray(jobs.id, ids));
-    await deleteObjects(expiredObjectKeys, "completed-job-retention-expired");
+    try {
+      // Delete the source last. If any output cleanup fails, the durable source
+      // remains available and the database keeps every object reference.
+      await deleteObjects(outputObjectKeys, "completed-job-retention-expired-output");
+      await deleteObjects([claimed[0].sourceKey], "completed-job-retention-expired-source");
+      await db.delete(jobs).where(and(eq(jobs.id, removableJob.id), eq(jobs.status, "cleanup_pending")));
+      removedIds.push(removableJob.id);
+    } catch (error) {
+      await db.update(jobs).set({ status: "completed", updatedAt: new Date() }).where(eq(jobs.id, removableJob.id));
+      console.error(`[R2 cleanup] job=${removableJob.id} action=kept-references reason=object-delete-failed error=${(error as Error).message}`);
+    }
   }
 
   const { purgeExpiredJobs } = await import("./storage");
@@ -242,7 +259,7 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
   const protectedMusicKeys = new Set(referencedMusic.flatMap((item) => item.key ? [item.key] : []));
   const removedPendingMusic = await deletePendingMusicOlderThan(cutoff, protectedMusicKeys);
 
-  return { removedJobs: ids.length, removedDirs, removedPendingMusic };
+  return { removedJobs: removedIds.length, removedDirs, removedPendingMusic };
 }
 
 export function startCleanupScheduler(): void {
@@ -510,18 +527,22 @@ export async function listJobs(limit = 12): Promise<ApiJob[]> {
 export async function deleteJob(jobId: string): Promise<void> {
   const [job] = await db.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
   if (!job) throw new AppError("not_found", `Job ${jobId} not found.`, { status: 404 });
+  if (job.status === "queued" || job.status === "processing" || job.status === "cleanup_pending") {
+    throw new AppError("bad_request", "An active job cannot be deleted while it may still need its source video.", { status: 409 });
+  }
   const storedClips = await db
     .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
     .from(clips)
     .where(eq(clips.jobId, jobId));
-  const objectKeys = [
-    job.sourceObjectKey,
+  const outputObjectKeys = [
     job.musicObjectKey,
     ...storedClips.flatMap((item) => [item.key, item.posterKey]),
   ];
+  // Keep database references unless all idempotent deletes succeed, and delete
+  // the source last so a failure removing outputs cannot destroy retry data.
+  await deleteObjects(outputObjectKeys, "user-deleted-job-output");
+  await deleteObjects([job.sourceObjectKey], "user-deleted-job-source");
   await db.delete(jobs).where(eq(jobs.id, jobId));
-  await deleteObjects(objectKeys, "user-deleted-job")
-    .catch((error) => console.warn(`[R2 cleanup] job=${jobId} action=kept reason=user-delete-object-failed detail=${(error as Error).message}`));
   await removePath(jobRoot(jobId));
 }
 

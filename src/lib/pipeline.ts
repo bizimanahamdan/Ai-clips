@@ -379,13 +379,16 @@ export async function runPipeline(jobId: string): Promise<void> {
     if (needsRendering) {
       renderSource = await ensureLocalSource();
       if (!authoritativeSourceObjectKey) {
-        throw new AppError("download_failed", "This job has no durable sourceObjectKey for rendering.", { status: 410 });
+        throw new AppError("source_object_missing", "This job has no durable sourceObjectKey for rendering.", {
+          detail: `job=${jobId} stage=rendering`,
+          status: 410,
+        });
       }
       const renderSourceMetadata = await headObject(authoritativeSourceObjectKey);
       console.info(`[R2 source check] job=${jobId} stage=rendering bucket=${config.r2BucketName} key=${authoritativeSourceObjectKey} exists=${renderSourceMetadata.exists}`);
       if (!renderSourceMetadata.exists) {
-        throw new AppError("download_failed", "The source video is missing from Cloudflare R2 before rendering.", {
-          detail: `job=${jobId} sourceObjectKey=${authoritativeSourceObjectKey}`,
+        throw new AppError("source_object_missing", "The source video is missing from Cloudflare R2 before rendering.", {
+          detail: `job=${jobId} stage=rendering sourceObjectKey=${authoritativeSourceObjectKey}`,
           status: 410,
         });
       }

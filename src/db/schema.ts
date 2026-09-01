@@ -22,7 +22,7 @@ export const jobs = pgTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    status: text("status").notNull().default("queued"), // queued | processing | completed | failed | partial
+    status: text("status").notNull().default("queued"), // queued | processing | completed | failed | partial | cleanup_pending
     stage: text("stage").notNull().default("queued"),
     stageDetail: text("stage_detail"),
     progress: integer("progress").notNull().default(0),

@@ -3,7 +3,7 @@ import path from "node:path";
 import { config } from "./config";
 import { AppError } from "./errors";
 import { downloadFromUrl, sanitizeFileName } from "./ingest";
-import { downloadObjectToFile, headObject, sourceObjectKey, uploadFileToR2 } from "./object-storage";
+import { downloadObjectToFile, headObject, uploadFileToR2 } from "./object-storage";
 
 export type VideoSourceKind = "upload" | "direct_url" | "dropbox" | "google_drive" | "url";
 export type VideoSourceProviderName = "upload" | "direct_url" | "dropbox" | "google_drive";
@@ -14,6 +14,8 @@ export type VideoSourceJob = {
   sourceName: string;
   sourceUrl: string | null;
   sourceObjectKey: string | null;
+  /** Null until a URL source has completed its first durable acquisition. */
+  fileSizeBytes: number | null;
 };
 
 export type AcquiredVideo = {
@@ -151,8 +153,24 @@ async function acquireRemote(
   if (job.sourceObjectKey) {
     const restored = await restorePersistedSource(job, workDir, provider);
     if (restored) return restored;
-    console.warn(`[R2 restore] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} missing=true action=redownload-same-key`);
+    // fileSizeBytes is persisted only after acquisition succeeds. Once set, a
+    // missing object is durable data loss and must not be masked by re-upload.
+    if (job.fileSizeBytes !== null) {
+      console.error(`[R2 source check] job=${job.id} stage=acquiring bucket=${config.r2BucketName} key=${job.sourceObjectKey} exists=false action=fail`);
+      throw new AppError("source_object_missing", "The persisted source video is missing from Cloudflare R2.", {
+        detail: `job=${job.id} stage=acquiring sourceObjectKey=${job.sourceObjectKey}`,
+        status: 410,
+      });
+    }
+    console.info(`[R2 source check] job=${job.id} stage=acquiring bucket=${config.r2BucketName} key=${job.sourceObjectKey} exists=false action=initial-url-acquisition`);
   }
+  if (!job.sourceObjectKey) {
+    throw new AppError("source_object_missing", "This URL job has no persisted sourceObjectKey.", {
+      detail: `job=${job.id} stage=acquiring`,
+      status: 410,
+    });
+  }
+  const canonicalSourceKey = job.sourceObjectKey;
   if (!job.sourceUrl) throw new AppError("bad_request", `This ${provider.replace("_", " ")} job has no source URL.`);
   const downloaded = await downloadFromUrl({
     url: resolveUrl(job.sourceUrl),
@@ -160,9 +178,9 @@ async function acquireRemote(
     targetDirectory: workDir,
     onProgress,
   });
-  // Every acquired source becomes durable. Reuse a persisted key exactly;
-  // generate only for a legacy URL job that predates canonical source keys.
-  const durableObjectKey = job.sourceObjectKey || sourceObjectKey(job.id, downloaded.fileName);
+  // createJob persists the canonical key before queueing. Acquisition uses
+  // that exact key and never derives a replacement from downloaded data.
+  const durableObjectKey = canonicalSourceKey;
   const contentType = downloaded.contentType || "application/octet-stream";
   await uploadFileToR2(downloaded.filePath, durableObjectKey, contentType);
   console.info(`[R2 upload] bucket=${config.r2BucketName} key=${durableObjectKey} size=${downloaded.sizeBytes} contentType=${contentType} job=${job.id}`);
@@ -189,13 +207,16 @@ const uploadAdapter: VideoSourceAdapter = {
   supports: (sourceType) => sourceType === "upload",
   async acquire(job, workDir) {
     if (!job.sourceObjectKey) {
-      throw new AppError("unsupported_media", "The uploaded source video is missing from Cloudflare R2. Please upload it again.", { status: 410 });
+      throw new AppError("source_object_missing", "This upload job has no persisted sourceObjectKey.", {
+        detail: `job=${job.id} stage=acquiring`,
+        status: 410,
+      });
     }
     const restored = await restorePersistedSource(job, workDir, "upload");
     if (!restored) {
       console.error(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} exists=false databaseField=sourceObjectKey`);
-      throw new AppError("download_failed", "The uploaded source video no longer exists at its persisted Cloudflare R2 key.", {
-        detail: `job=${job.id} media=${job.sourceName} sourceObjectKey=${job.sourceObjectKey}. The exact database key was checked; bucket contents at other keys do not satisfy this job.`,
+      throw new AppError("source_object_missing", "The uploaded source video no longer exists at its persisted Cloudflare R2 key.", {
+        detail: `job=${job.id} stage=acquiring media=${job.sourceName} sourceObjectKey=${job.sourceObjectKey}. The exact database key was checked; bucket contents at other keys do not satisfy this job.`,
         status: 410,
       });
     }

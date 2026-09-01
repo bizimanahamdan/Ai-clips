@@ -10,7 +10,7 @@ import { headObject } from "@/lib/object-storage";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Re-run a failed or partially failed job from the beginning. */
+/** Resume a failed or partial job from its earliest incomplete checkpoint. */
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     await ensureRuntime();
@@ -20,20 +20,29 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
     if (job.status === "queued" || job.status === "processing") {
       return NextResponse.json({ jobId: id, alreadyRunning: true });
     }
-    if (job.sourceType === "upload") {
-      if (!job.sourceObjectKey) {
-        throw new AppError("unsupported_media", "This job has no persisted sourceObjectKey. Please upload the video again.", { status: 410 });
-      }
+    if (job.status === "cleanup_pending") {
+      throw new AppError("bad_request", "This completed job is currently being removed by retention cleanup.", { status: 409 });
+    }
+    if (!job.sourceObjectKey && job.sourceType === "upload") {
+      throw new AppError("source_object_missing", "This upload job has no persisted sourceObjectKey.", {
+        detail: `job=${id} stage=retry`,
+        status: 410,
+      });
+    }
+    // A non-null size means acquisition completed and the persisted key must
+    // exist. Do not hide durable data loss by re-uploading or redownloading.
+    if (job.sourceObjectKey && job.fileSizeBytes !== null) {
       const source = await headObject(job.sourceObjectKey);
-      console.info(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${id} exists=${source.exists} action=retry-check`);
+      console.info(`[R2 source check] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${id} stage=retry exists=${source.exists}`);
       if (!source.exists) {
         throw new AppError(
-          "unsupported_media",
-          "The original upload no longer exists at this job's exact Cloudflare R2 key. Please upload it again.",
-          { detail: `job=${id} sourceObjectKey=${job.sourceObjectKey}`, status: 410 },
+          "source_object_missing",
+          "The source no longer exists at this job's exact Cloudflare R2 key.",
+          { detail: `job=${id} stage=retry sourceObjectKey=${job.sourceObjectKey}`, status: 410 },
         );
       }
     }
+    console.info(`[retry checkpoint] job=${id} stage=${job.stage} transcript=${Boolean(job.transcript)} analysisSelection=${Boolean(job.analysisCheckpoint?.selectionComplete)} sourceObjectKey=${job.sourceObjectKey ?? "none"}`);
 
     await db
       .update(jobs)
@@ -62,7 +71,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
   } catch (error) {
     const payload = toErrorPayload(error);
     return NextResponse.json(
-      { error: payload.message, kind: payload.kind },
+      { error: payload.message, kind: payload.kind, detail: payload.detail },
       { status: error instanceof AppError ? error.status : 500 },
     );
   }

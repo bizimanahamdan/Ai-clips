@@ -24,7 +24,7 @@ This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can 
 * Direct public video URLs are acquired through the source-provider layer and saved under the job's canonical R2 `sourceObjectKey`; legacy `PERSIST_URL_SOURCES` configuration remains accepted, but new jobs always keep a durable retry source.
 * Each rendered clip and poster is uploaded to R2 immediately, then its local copy is deleted.
 * The entire scratch directory and local source are removed in the pipeline `finally` block on success or failure.
-* Completed jobs retain their source and outputs until `RETENTION_HOURS` expires. Failed/partial jobs retain their source and database row for safe retry; explicit user deletion still removes their objects. Retention cleanup removes database references before deleting completed-job R2 objects, so a cleanup failure cannot leave a live job pointing at a deleted key.
+* Completed jobs retain their source and outputs until `RETENTION_HOURS` expires. Failed/partial jobs retain their source and database row for safe retry; explicit user deletion still removes their objects. Retention cleanup atomically claims only completed jobs, deletes their R2 objects idempotently, and removes database references only after R2 deletion succeeds.
 * Clip playback/download keeps the existing same-origin API URL. The API streams the private R2 object and supports HTTP Range requests.
 
 ## Local development

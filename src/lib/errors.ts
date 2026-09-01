@@ -3,6 +3,7 @@ export type ErrorKind =
   | "unsupported_media"
   | "too_large"
   | "download_failed"
+  | "source_object_missing"
   | "transcription_failed"
   | "invalid_ai_output"
   | "ffmpeg_error"
