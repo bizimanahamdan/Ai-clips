@@ -88,6 +88,7 @@ export const config = {
   analysisDiscoveryOutputTokens: num("ANALYSIS_DISCOVERY_OUTPUT_TOKENS", 1_200),
   analysisSelectionOutputTokens: num("ANALYSIS_SELECTION_OUTPUT_TOKENS", 700),
   analysisGroqTotalTokens: num("ANALYSIS_GROQ_TOTAL_TOKENS", 6_500),
+  analysisGroqTokensPerMinute: num("ANALYSIS_GROQ_TOKENS_PER_MINUTE", 8_000),
   /** Legacy character bound remains a secondary guard for existing deployments. */
   analysisTranscriptMaxChars: num("ANALYSIS_TRANSCRIPT_MAX_CHARS", 12_000),
   analysisChunkOverlapSec: num("ANALYSIS_CHUNK_OVERLAP_SEC", 30),

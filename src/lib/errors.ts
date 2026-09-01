@@ -56,6 +56,14 @@ export function describeHttpStatus(status: number, provider: string, body: strin
       providerStatus: status,
     });
   }
+  if (status === 408) {
+    return new AppError("internal", `${provider} request timed out (HTTP 408).`, {
+      detail: snippet,
+      status: 502,
+      retryable: true,
+      providerStatus: status,
+    });
+  }
   if (status === 429) {
     return new AppError(
       "rate_limited",

@@ -21,7 +21,7 @@ This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can 
 
 * Browser uploads stream directly into one canonical private-R2 key; that exact `sourceObjectKey` is HEAD-verified before the job row is created.
 * A worker HEAD-checks and downloads only the persisted `sourceObjectKey` into its job scratch directory immediately before processing; it never reconstructs an upload key.
-* Direct public video URLs are acquired through the source-provider layer directly into the active job's scratch directory. They are not retained in R2 unless `PERSIST_URL_SOURCES=true`.
+* Direct public video URLs are acquired through the source-provider layer and saved under the job's canonical R2 `sourceObjectKey`; legacy `PERSIST_URL_SOURCES` configuration remains accepted, but new jobs always keep a durable retry source.
 * Each rendered clip and poster is uploaded to R2 immediately, then its local copy is deleted.
 * The entire scratch directory and local source are removed in the pipeline `finally` block on success or failure.
 * Completed jobs retain their source and outputs until `RETENTION_HOURS` expires. Failed/partial jobs retain their source and database row for safe retry; explicit user deletion still removes their objects. Retention cleanup removes database references before deleting completed-job R2 objects, so a cleanup failure cannot leave a live job pointing at a deleted key.
@@ -104,7 +104,6 @@ STORAGE_DIR=/tmp/clipforge
 MAX_CONCURRENT_JOBS=1
 RETENTION_HOURS=24
 MAX_URL_REDIRECTS=5
-PERSIST_URL_SOURCES=false
 MAX_MUSIC_UPLOAD_MB=50
 MAX_MUSIC_DURATION_MINUTES=30
 OUTPUT_SQUARE_SIZE=1080
@@ -130,6 +129,7 @@ ANALYSIS_PROMPT_RESERVE_TOKENS=1000
 ANALYSIS_DISCOVERY_OUTPUT_TOKENS=1200
 ANALYSIS_SELECTION_OUTPUT_TOKENS=700
 ANALYSIS_GROQ_TOTAL_TOKENS=6500
+ANALYSIS_GROQ_TOKENS_PER_MINUTE=8000
 ANALYSIS_TRANSCRIPT_MAX_CHARS=12000
 ANALYSIS_CHUNK_MAX_SECONDS=600
 ANALYSIS_CHUNK_OVERLAP_SEC=30
@@ -138,7 +138,9 @@ ANALYSIS_GROQ_SAFE_CHARS=14000
 
 Timestamped transcript segments are split primarily by a conservative token estimate, with character/time limits as secondary guards and a small duration-aware overlap. The default 4,500-token input ceiling reserves 1,000 tokens for instructions, leaving roughly 3,500 estimated transcript tokens per discovery part. Discovery runs independently on every part; long videos then receive a compact global candidate-ranking pass. Output is capped at 1,200 tokens for discovery and 700 for ranking instead of 4,096.
 
-The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. Groq is excluded before a request would exceed its conservative total budget; an unexpected Groq 413 receives one retry using a much smaller segment-boundary section. HTTP 429 honors `Retry-After` with bounded exponential backoff. Failed parts do not discard candidates from successful parts, and the job fails analysis only when no usable candidates survive. Video data is never sent to an analysis model.
+The backend trims overlong descriptive fields, repairs common JSON wrappers, validates real segment indexes/timestamps, removes overlap, and selects final clips globally. One request per provider/model is allowed at a time; Groq requests are additionally paced against `ANALYSIS_GROQ_TOKENS_PER_MINUTE`. HTTP 429 honors `Retry-After` with exponential backoff and jitter, while OpenRouter 402 and model 404 responses enter a provider cooldown instead of being hammered repeatedly.
+
+Prepared transcript parts, each part's successful candidates/provider attempts, and final selection are persisted in `jobs.analysis_checkpoint`. A retry reuses the saved transcript and successful parts and processes only incomplete parts. Selected clip rows are idempotent render checkpoints: ready R2 outputs are reused, while failed or missing outputs alone are rendered again. Video data is never sent to an analysis model.
 
 ## Database migrations
 

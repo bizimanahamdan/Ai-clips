@@ -135,9 +135,11 @@ export async function ensureRuntime(): Promise<void> {
 
 function enqueue(jobId: string): void {
   const state = queue();
-  if (state.running.has(jobId) || state.pending.includes(jobId)) return;
+  if (state.pending.includes(jobId)) return;
   state.pending.push(jobId);
-  pump();
+  // If the previous attempt is still unwinding, its finally block will remove
+  // the running marker and pump this saved-checkpoint retry exactly once.
+  if (!state.running.has(jobId)) pump();
 }
 
 /** Public hook so API routes can re-queue an existing job row. */
@@ -297,7 +299,7 @@ export async function createJob(input: CreateJobInput): Promise<string> {
   const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   const remoteSource = input.sourceType !== "upload";
   const authoritativeSourceKey = input.sourceObjectKey
-    ?? (remoteSource && config.persistUrlSources ? sourceObjectKey(id, input.sourceName) : null);
+    ?? (remoteSource ? sourceObjectKey(id, input.sourceName) : null);
   let authoritativeSourceSize = input.fileSizeBytes ?? null;
   if (input.sourceType === "upload") {
     if (!authoritativeSourceKey) {

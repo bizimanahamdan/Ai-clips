@@ -28,6 +28,45 @@ export type ClipCandidate = {
   score: number;
 };
 
+export type AnalysisCheckpointAttempt = {
+  provider: "gemini" | "openrouter" | "groq";
+  model: string;
+  attempt: number;
+  outcome: "failed" | "succeeded";
+  detail: string;
+  phase?: "discovery" | "selection";
+  chunk?: number;
+};
+
+export type AnalysisChunkCheckpoint = {
+  index: number;
+  startSegment: number;
+  endSegment: number;
+  startSec: number;
+  endSec: number;
+  characterCount: number;
+  estimatedTokens: number;
+  block: string;
+  status: "pending" | "succeeded" | "failed";
+  candidates: ClipCandidate[];
+  attempts: AnalysisCheckpointAttempt[];
+  error?: string;
+};
+
+/** One resumable JSONB document, keyed by job + deterministic chunk index. */
+export type AnalysisCheckpoint = {
+  version: 1;
+  signature: string;
+  chunks: AnalysisChunkCheckpoint[];
+  finalClips?: ClipCandidate[];
+  selectionComplete: boolean;
+  provider?: "gemini" | "openrouter" | "groq";
+  model?: string;
+  raw?: string;
+  selectionAttempts?: AnalysisCheckpointAttempt[];
+  updatedAt: string;
+};
+
 export type JobStatus = "queued" | "processing" | "completed" | "failed" | "partial";
 
 export type Stage =

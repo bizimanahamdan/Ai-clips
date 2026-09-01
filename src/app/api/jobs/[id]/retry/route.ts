@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { clips, jobEvents, jobs } from "@/db/schema";
+import { jobEvents, jobs } from "@/db/schema";
 import { AppError, toErrorPayload } from "@/lib/errors";
-import { createJobDir } from "@/lib/storage";
 import { ensureRuntime } from "@/lib/jobs";
 import { config } from "@/lib/config";
-import { deleteObjects, headObject } from "@/lib/object-storage";
+import { headObject } from "@/lib/object-storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,20 +35,12 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
       }
     }
 
-    await createJobDir(id);
-    const oldClips = await db
-      .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
-      .from(clips)
-      .where(eq(clips.jobId, id));
-    await db.delete(clips).where(eq(clips.jobId, id));
-    await deleteObjects(oldClips.flatMap((clip) => [clip.key, clip.posterKey]), "retry-reset-output")
-      .catch((error) => console.warn(`[R2 cleanup] job=${id} action=kept reason=retry-output-delete-failed detail=${(error as Error).message}`));
     await db
       .update(jobs)
       .set({
         status: "queued",
         stage: "queued",
-        stageDetail: "Queued for retry",
+        stageDetail: "Queued to resume from saved checkpoints",
         progress: 0,
         error: null,
         finishedAt: null,
@@ -61,7 +52,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
       jobId: id,
       stage: "queued",
       level: "warn",
-      message: "Retry requested — the pipeline will run again from the start.",
+      message: "Retry requested — saved source, probe, transcript, chunk analysis, selection, and completed renders will be reused.",
     });
 
     const { enqueueJob } = await import("@/lib/jobs");

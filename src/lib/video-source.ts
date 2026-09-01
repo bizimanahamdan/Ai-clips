@@ -160,22 +160,19 @@ async function acquireRemote(
     targetDirectory: workDir,
     onProgress,
   });
-  let durableObjectKey: string | null = null;
-  if (config.persistUrlSources || job.sourceObjectKey) {
-    // Reuse a persisted key exactly. Generate a key only for the first durable
-    // acquisition of a URL source, never during a later restore.
-    durableObjectKey = job.sourceObjectKey || sourceObjectKey(job.id, downloaded.fileName);
-    const contentType = downloaded.contentType || "application/octet-stream";
-    await uploadFileToR2(downloaded.filePath, durableObjectKey, contentType);
-    console.info(`[R2 upload] bucket=${config.r2BucketName} key=${durableObjectKey} size=${downloaded.sizeBytes} contentType=${contentType} job=${job.id}`);
-    const verified = await headObject(durableObjectKey);
-    console.info(`[R2 verify-upload] bucket=${config.r2BucketName} key=${durableObjectKey} exists=${verified.exists} size=${verified.sizeBytes ?? "unknown"} contentType=${verified.contentType ?? "unknown"} job=${job.id}`);
-    if (!verified.exists || (verified.sizeBytes !== null && verified.sizeBytes !== downloaded.sizeBytes)) {
-      throw new AppError("internal", "Could not verify the durable URL source in Cloudflare R2.", {
-        detail: `job=${job.id} sourceObjectKey=${durableObjectKey} local=${downloaded.sizeBytes} stored=${verified.sizeBytes ?? "missing"}`,
-        status: 502,
-      });
-    }
+  // Every acquired source becomes durable. Reuse a persisted key exactly;
+  // generate only for a legacy URL job that predates canonical source keys.
+  const durableObjectKey = job.sourceObjectKey || sourceObjectKey(job.id, downloaded.fileName);
+  const contentType = downloaded.contentType || "application/octet-stream";
+  await uploadFileToR2(downloaded.filePath, durableObjectKey, contentType);
+  console.info(`[R2 upload] bucket=${config.r2BucketName} key=${durableObjectKey} size=${downloaded.sizeBytes} contentType=${contentType} job=${job.id}`);
+  const verified = await headObject(durableObjectKey);
+  console.info(`[R2 verify-upload] bucket=${config.r2BucketName} key=${durableObjectKey} exists=${verified.exists} size=${verified.sizeBytes ?? "unknown"} contentType=${verified.contentType ?? "unknown"} job=${job.id}`);
+  if (!verified.exists || (verified.sizeBytes !== null && verified.sizeBytes !== downloaded.sizeBytes)) {
+    throw new AppError("internal", "Could not verify the durable URL source in Cloudflare R2.", {
+      detail: `job=${job.id} sourceObjectKey=${durableObjectKey} local=${downloaded.sizeBytes} stored=${verified.sizeBytes ?? "missing"}`,
+      status: 502,
+    });
   }
   return {
     localPath: downloaded.filePath,

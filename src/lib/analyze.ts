@@ -1,19 +1,12 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { config, providersConfigured, type AnalysisProvider } from "./config";
 import { AppError, describeHttpStatus } from "./errors";
-import type { ClipCandidate, Transcript } from "./types";
+import type { AnalysisCheckpoint, AnalysisCheckpointAttempt, ClipCandidate, Transcript } from "./types";
 import { preferredClipMin } from "./clip-duration";
 import { validateClips } from "./validate";
 
-export type AnalysisAttempt = {
-  provider: AnalysisProvider;
-  model: string;
-  attempt: number;
-  outcome: "failed" | "succeeded";
-  detail: string;
-  phase?: "discovery" | "selection";
-  chunk?: number;
-};
+export type AnalysisAttempt = AnalysisCheckpointAttempt;
 
 export type AnalysisProgress = {
   phase: "preparing" | "discovery" | "selection";
@@ -281,11 +274,76 @@ function providerModel(provider: AnalysisProvider): string {
   return provider === "openrouter" ? config.openrouterTextModel : config.groqTextModel;
 }
 
+type ProviderRuntimeState = {
+  tails: Map<string, Promise<void>>;
+  cooldownUntil: Map<string, number>;
+  unavailableUntil: Map<string, number>;
+};
+
+const providerGlobal = globalThis as typeof globalThis & { __clipforgeProviderState?: ProviderRuntimeState };
+function providerState(): ProviderRuntimeState {
+  providerGlobal.__clipforgeProviderState ??= {
+    tails: new Map(),
+    cooldownUntil: new Map(),
+    unavailableUntil: new Map(),
+  };
+  return providerGlobal.__clipforgeProviderState;
+}
+
+function providerRuntimeKey(provider: AnalysisProvider): string {
+  return `${provider}:${providerModel(provider)}`;
+}
+
+function providerTemporarilyUnavailable(provider: AnalysisProvider): boolean {
+  return (providerState().unavailableUntil.get(providerRuntimeKey(provider)) ?? 0) > Date.now();
+}
+
+function blockProvider(provider: AnalysisProvider, milliseconds: number): void {
+  providerState().unavailableUntil.set(providerRuntimeKey(provider), Date.now() + milliseconds);
+}
+
+function setProviderCooldown(provider: AnalysisProvider, milliseconds: number): void {
+  const state = providerState();
+  const key = providerRuntimeKey(provider);
+  state.cooldownUntil.set(key, Math.max(state.cooldownUntil.get(key) ?? 0, Date.now() + milliseconds));
+}
+
+/** One in-flight request per provider/model across jobs in this process. */
+async function withProviderSlot<T>(provider: AnalysisProvider, work: () => Promise<T>): Promise<T> {
+  const state = providerState();
+  const key = providerRuntimeKey(provider);
+  const previous = state.tails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  state.tails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    const waitMs = Math.max(0, (state.cooldownUntil.get(key) ?? 0) - Date.now());
+    if (waitMs) {
+      console.info(`[analysis] provider=${provider} model=${providerModel(provider)} rate_limit_wait_ms=${waitMs}`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    return await work();
+  } finally {
+    release();
+    if (state.tails.get(key) === tail) void tail.finally(() => state.tails.delete(key));
+  }
+}
+
 function retryAfterMilliseconds(response: Response): number | undefined {
-  const value = response.headers.get("retry-after")?.trim();
+  const value = response.headers.get("retry-after")?.trim()
+    || response.headers.get("x-ratelimit-reset-after")?.trim()
+    || response.headers.get("x-ratelimit-reset-requests")?.trim();
   if (!value) return undefined;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const normalized = value.toLowerCase().replace(/ms$/, "").replace(/s$/, "");
+  const amount = Number(normalized);
+  if (Number.isFinite(amount) && amount >= 0) {
+    if (/ms$/i.test(value)) return amount;
+    // Large integer reset values are commonly Unix timestamps.
+    if (amount > 1_000_000_000) return Math.max(0, amount * 1_000 - Date.now());
+    return amount * 1_000;
+  }
   const date = Date.parse(value);
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
@@ -587,7 +645,7 @@ export function normaliseClips(value: unknown, transcript: Transcript, durationS
     if (clip.startSegment !== undefined && clip.endSegment !== undefined) {
       const start = transcript.segments[clip.startSegment];
       const end = transcript.segments[clip.endSegment];
-      if (!start || !end || clip.endSegment < clip.startSegment) {
+      if (!start || !end || clip.endSegment <= clip.startSegment) {
         issues.push(`candidate ${index + 1}: invalid segment indexes`);
         return;
       }
@@ -624,6 +682,10 @@ export function normaliseClips(value: unknown, transcript: Transcript, durationS
 function configuredProviders(prompt: string, outputTokenLimit: number): AnalysisProvider[] {
   const inputTokens = estimateTokens(`${SYSTEM_PROMPT}\n${prompt}`);
   return providersConfigured().order.filter((provider) => {
+    if (providerTemporarilyUnavailable(provider)) {
+      console.info(`[analysis] provider=${provider} model=${providerModel(provider)} skipped=global-cooldown`);
+      return false;
+    }
     if (provider === "groq" && (
       prompt.length > config.analysisGroqSafeChars
       || inputTokens + outputTokenLimit > config.analysisGroqTotalTokens
@@ -657,6 +719,7 @@ async function runWithFallback(options: {
   parse: (content: string, requestPrompt: string) => unknown;
   phase: "discovery" | "selection";
   chunk?: number;
+  jobId?: string;
   attempts: AnalysisAttempt[];
   unavailableProviders: Set<AnalysisProvider>;
 }): Promise<{ value: unknown; provider: AnalysisProvider; model: string; raw: string }> {
@@ -684,50 +747,74 @@ async function runWithFallback(options: {
       const user = correction ? `${providerUser}\nCORRECTION: ${correction}` : providerUser;
       const inputTokens = estimateTokens(`${SYSTEM_PROMPT}\n${user}`);
       console.info(
-        `[analysis] provider=${provider} model=${model} chunk=${options.chunk !== undefined ? `${options.chunk + 1}` : "ranking"} input_estimated_tokens=${inputTokens} output_token_limit=${outputTokenLimit} retry=${attempt - 1}`,
+        `[analysis] job=${options.jobId ?? "unknown"} provider=${provider} model=${model} chunk=${options.chunk !== undefined ? `${options.chunk + 1}` : "ranking"} input_estimated_tokens=${inputTokens} output_token_limit=${outputTokenLimit} retry=${attempt - 1}`,
       );
       try {
-        const raw = await callProvider({
-          provider,
-          system: SYSTEM_PROMPT,
-          user,
-          mode: attempt === 1 ? "json_schema" : "json_object",
-          schema: options.schema,
-          outputTokenLimit,
+        const raw = await withProviderSlot(provider, async () => {
+          let response: string;
+          try {
+            response = await callProvider({
+              provider,
+              system: SYSTEM_PROMPT,
+              user,
+              mode: attempt === 1 ? "json_schema" : "json_object",
+              schema: options.schema,
+              outputTokenLimit,
+            });
+          } catch (error) {
+            if (error instanceof AppError && error.providerStatus === 429) {
+              setProviderCooldown(provider, Math.max(1_000, error.retryAfterMs ?? 0));
+            }
+            throw error;
+          }
+          if (provider === "groq") {
+            const spacingMs = Math.ceil(((inputTokens + outputTokenLimit) / config.analysisGroqTokensPerMinute) * 60_000);
+            setProviderCooldown(provider, spacingMs);
+            console.info(`[analysis] job=${options.jobId ?? "unknown"} provider=groq model=${model} tpm_spacing_ms=${spacingMs}`);
+          }
+          return response;
         });
         const value = options.parse(raw, user);
         options.attempts.push({ provider, model, attempt, outcome: "succeeded", detail: "valid response", phase: options.phase, chunk: options.chunk });
+        console.info(`[analysis] job=${options.jobId ?? "unknown"} provider=${provider} model=${model} chunk=${options.chunk !== undefined ? options.chunk + 1 : "ranking"} validation=passed`);
         return { value, provider, model, raw };
       } catch (error) {
         const appError = error instanceof AppError ? error : new AppError("invalid_ai_output", (error as Error).message, { retryable: true });
         const detail = `${appError.message}${appError.detail ? ` — ${appError.detail.slice(0, 300)}` : ""}`;
         options.attempts.push({ provider, model, attempt, outcome: "failed", detail, phase: options.phase, chunk: options.chunk });
-        console.warn(`[analysis] provider=${provider} model=${model} chunk=${options.chunk !== undefined ? options.chunk + 1 : "ranking"} retry=${attempt - 1} failed: ${detail}`);
+        console.warn(`[analysis] job=${options.jobId ?? "unknown"} provider=${provider} model=${model} chunk=${options.chunk !== undefined ? options.chunk + 1 : "ranking"} retry=${attempt - 1} http_status=${appError.providerStatus ?? "network-or-validation"} validation=failed detail=${detail}`);
         if ([401, 402, 403, 404].includes(appError.providerStatus ?? 0)) {
           options.unavailableProviders.add(provider);
-          console.warn(`[analysis] provider=${provider} model=${model} unavailable for the remainder of this job; continuing with fallback providers`);
+          const globalBlockMs = appError.providerStatus === 404 ? 60 * 60_000 : appError.providerStatus === 402 ? 2 * 60_000 : 5 * 60_000;
+          blockProvider(provider, globalBlockMs);
+          console.warn(`[analysis] job=${options.jobId ?? "unknown"} provider=${provider} model=${model} unavailable for the remainder of this job; continuing with fallback providers`);
         }
 
         const groqOversizeRetry = provider === "groq" && appError.providerStatus === 413 && attempt === 1 && options.phase === "discovery";
         if (groqOversizeRetry) {
           providerUser = reduceTranscriptPrompt(options.user, options.chunk ?? 0);
           correction = "Return only valid JSON for the smaller transcript section below.";
-          console.warn(`[analysis] provider=groq model=${model} chunk=${(options.chunk ?? 0) + 1} HTTP 413; retrying once with input_estimated_tokens=${estimateTokens(providerUser)}`);
+          console.warn(`[analysis] job=${options.jobId ?? "unknown"} provider=groq model=${model} chunk=${(options.chunk ?? 0) + 1} HTTP 413; retrying once with input_estimated_tokens=${estimateTokens(providerUser)}`);
         } else {
           correction = "Return ONLY complete valid JSON, with no markdown or explanation. Keep title <= 80 chars, hook <= 60 chars, reason <= 240 chars, and use only supplied IDs/boundaries.";
         }
 
         const transient = appError.retryable || appError.kind === "rate_limited";
-        const retryAfterTooLong = appError.providerStatus === 429 && (appError.retryAfterMs ?? 0) > 60_000;
-        if (retryAfterTooLong) {
-          console.warn(`[analysis] provider=${provider} retry-after=${appError.retryAfterMs}ms is too long for an inline retry; continuing fallback`);
-        }
-        if ((!transient && !groqOversizeRetry) || retryAfterTooLong || attempt >= maxAttempts) break;
-        const exponentialDelay = Math.min(30_000, 750 * (2 ** (attempt - 1)));
+        const jitter = Math.floor(Math.random() * 350);
+        const exponentialDelay = Math.min(30_000, 750 * (2 ** (attempt - 1))) + jitter;
         const delay = appError.providerStatus === 429
           ? Math.max(exponentialDelay, appError.retryAfterMs ?? 0)
-          : provider === "gemini" ? exponentialDelay : 0;
-        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+          : exponentialDelay;
+        const retryAfterTooLong = appError.providerStatus === 429 && delay > 60_000;
+        if (appError.providerStatus === 429) setProviderCooldown(provider, delay);
+        if (retryAfterTooLong) {
+          options.unavailableProviders.add(provider);
+          blockProvider(provider, Math.min(delay, 5 * 60_000));
+          console.warn(`[analysis] job=${options.jobId ?? "unknown"} provider=${provider} retry-after=${delay}ms is too long for an inline retry; continuing fallback`);
+        }
+        if ((!transient && !groqOversizeRetry) || retryAfterTooLong || attempt >= maxAttempts) break;
+        console.info(`[analysis] job=${options.jobId ?? "unknown"} provider=${provider} model=${model} chunk=${options.chunk !== undefined ? options.chunk + 1 : "ranking"} retry_delay_ms=${delay}`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
@@ -765,20 +852,93 @@ function selectionPrompt(candidates: ClipCandidate[], count: number, preferredVi
   ].filter(Boolean).join("\n");
 }
 
+function checkpointSignature(options: {
+  transcript: Transcript;
+  clipCount: number;
+  maxClipSec: number;
+}): string {
+  const first = options.transcript.segments[0];
+  const last = options.transcript.segments.at(-1);
+  return [
+    "v1",
+    options.transcript.segments.length,
+    options.transcript.text.length,
+    createHash("sha256").update(options.transcript.text).digest("hex").slice(0, 20),
+    options.transcript.durationSec.toFixed(3),
+    first?.start.toFixed(3) ?? "0",
+    last?.end.toFixed(3) ?? "0",
+    options.clipCount,
+    options.maxClipSec,
+    config.analysisMaxInputTokens,
+    config.analysisTranscriptMaxChars,
+    config.analysisChunkMaxSec,
+    config.analysisChunkOverlapSec,
+  ].join(":");
+}
+
+function checkpointMatches(
+  checkpoint: AnalysisCheckpoint | null | undefined,
+  signature: string,
+  chunks: TranscriptAnalysisChunk[],
+): checkpoint is AnalysisCheckpoint {
+  return Boolean(
+    checkpoint
+    && checkpoint.version === 1
+    && checkpoint.signature === signature
+    && Array.isArray(checkpoint.chunks)
+    && checkpoint.chunks.length === chunks.length
+    && checkpoint.chunks.every((saved, index) =>
+      saved.index === index
+      && saved.startSegment === chunks[index].startSegment
+      && saved.endSegment === chunks[index].endSegment
+      && typeof saved.block === "string"
+      && Array.isArray(saved.candidates)
+      && Array.isArray(saved.attempts)),
+  );
+}
+
+function validSavedCandidates(candidates: ClipCandidate[], transcript: Transcript, durationSec: number): ClipCandidate[] {
+  return candidates.filter((candidate) => {
+    if (!Number.isFinite(candidate.startSec) || !Number.isFinite(candidate.endSec)
+      || candidate.startSec < 0 || candidate.endSec <= candidate.startSec || candidate.endSec > durationSec
+      || typeof candidate.title !== "string" || typeof candidate.hook !== "string" || typeof candidate.reason !== "string"
+      || !Number.isFinite(candidate.score)) return false;
+    if (candidate.startSegment === undefined && candidate.endSegment === undefined) return true;
+    if (!Number.isInteger(candidate.startSegment) || !Number.isInteger(candidate.endSegment)
+      || candidate.startSegment! < 0 || candidate.endSegment! <= candidate.startSegment!) return false;
+    const start = transcript.segments[candidate.startSegment!];
+    const end = transcript.segments[candidate.endSegment!];
+    return Boolean(start && end && start.start === candidate.startSec && end.end === candidate.endSec);
+  });
+}
+
 /** Chunked discovery plus global selection; no request contains the full long transcript. */
 export async function analyseTranscript(options: {
+  jobId?: string;
   transcript: Transcript;
   durationSec: number;
   clipCount: number;
   maxClipSec: number;
   preferredProvider?: AnalysisProvider | null;
   preferredVibes?: string[];
+  checkpoint?: AnalysisCheckpoint | null;
+  onCheckpoint?: (checkpoint: AnalysisCheckpoint) => void | Promise<void>;
   onProgress?: (progress: AnalysisProgress) => void | Promise<void>;
 }): Promise<AnalysisResult> {
   void options.preferredProvider; // Provider order is centralized and deterministic.
   const selectedMaxSec = Math.min(config.maxClipSec, Math.max(config.minClipSec, options.maxClipSec), options.durationSec);
+  const signature = checkpointSignature(options);
+  const persistedChunks = options.checkpoint?.version === 1
+    && options.checkpoint.signature === signature
+    && Array.isArray(options.checkpoint.chunks)
+    && options.checkpoint.chunks.length > 0
+    && options.checkpoint.chunks.every((chunk, index) => chunk.index === index && typeof chunk.block === "string")
+    ? options.checkpoint.chunks
+    : null;
   const chunkOverlapSec = Math.max(config.analysisChunkOverlapSec, Math.min(90, selectedMaxSec));
-  const chunks = splitTranscriptForAnalysis(options.transcript, config.analysisTranscriptMaxChars, chunkOverlapSec);
+  const chunks: TranscriptAnalysisChunk[] = persistedChunks
+    ? persistedChunks.map(({ status: _status, candidates: _candidates, attempts: _attempts, error: _error, ...chunk }) => chunk)
+    : splitTranscriptForAnalysis(options.transcript, config.analysisTranscriptMaxChars, chunkOverlapSec);
   if (!chunks.length) throw new AppError("invalid_ai_output", "Transcript is empty, so no clip analysis is possible.");
   const configured = providersConfigured();
   if (config.geminiApiKey && !config.geminiTextModel) {
@@ -794,20 +954,79 @@ export async function analyseTranscript(options: {
   const targetCandidates = Math.min(40, Math.max(options.clipCount * config.analysisCandidateMultiplier, options.clipCount));
   const perChunk = Math.min(6, Math.max(3, Math.ceil(targetCandidates / chunks.length) + 1));
   const preferredVibes = [...new Set((options.preferredVibes ?? []).map((tag) => tag.trim()).filter(Boolean))].slice(0, 12);
+  const checkpoint: AnalysisCheckpoint = checkpointMatches(options.checkpoint, signature, chunks)
+    ? {
+        ...options.checkpoint,
+        chunks: options.checkpoint.chunks.map((chunk) => ({
+          ...chunk,
+          candidates: [...chunk.candidates],
+          attempts: [...chunk.attempts],
+        })),
+      }
+    : {
+        version: 1,
+        signature,
+        chunks: chunks.map((chunk) => ({
+          ...chunk,
+          status: "pending" as const,
+          candidates: [],
+          attempts: [],
+        })),
+        selectionComplete: false,
+        updatedAt: new Date().toISOString(),
+      };
+  if (!checkpointMatches(options.checkpoint, signature, chunks)) {
+    await options.onCheckpoint?.(checkpoint);
+  }
+
   const attempts: AnalysisAttempt[] = [];
   const unavailableProviders = new Set<AnalysisProvider>();
   const candidates: ClipCandidate[] = [];
-  let lastProvider = configured.order[0];
-  let lastModel = providerModel(lastProvider);
-  let lastRaw = "";
+  let lastProvider = checkpoint.provider ?? configured.order[0];
+  let lastModel = checkpoint.model ?? providerModel(lastProvider);
+  let lastRaw = checkpoint.raw ?? "";
 
   await options.onProgress?.({ phase: "preparing", completed: 0, total: chunks.length, message: `Preparing ${chunks.length} transcript part(s)…` });
-  console.info(`[analysis] prepared ${chunks.length} transcript chunk(s), ${options.transcript.segments.length} segments`);
+  console.info(`[analysis] prepared ${chunks.length} transcript chunk(s), ${options.transcript.segments.length} segments checkpoint=${options.checkpoint ? "loaded" : "new"}`);
+
+  if (checkpoint.selectionComplete && checkpoint.finalClips?.length) {
+    const cachedFinal = validSavedCandidates(checkpoint.finalClips, options.transcript, options.durationSec);
+    if (cachedFinal.length) {
+      console.info(`[analysis] checkpoint=final-selection action=reused clips=${cachedFinal.length}`);
+      return {
+        clips: cachedFinal,
+        provider: lastProvider,
+        model: lastModel,
+        raw: lastRaw,
+        attempts,
+        chunkCount: chunks.length,
+        discoveredCandidates: checkpoint.chunks.reduce((sum, chunk) => sum + chunk.candidates.length, 0),
+      };
+    }
+    checkpoint.selectionComplete = false;
+    checkpoint.finalClips = undefined;
+  }
+
+  let failedChunks = 0;
   for (const chunk of chunks) {
+    const savedChunk = checkpoint.chunks[chunk.index];
+    if (savedChunk.status === "succeeded") {
+      const reusable = validSavedCandidates(savedChunk.candidates, options.transcript, options.durationSec);
+      if (reusable.length === savedChunk.candidates.length && reusable.length) {
+        candidates.push(...reusable);
+        console.info(`[analysis] chunk=${chunk.index + 1}/${chunks.length} checkpoint=succeeded action=reused candidates=${reusable.length}`);
+        await options.onProgress?.({ phase: "discovery", completed: chunk.index + 1, total: chunks.length, message: `Reused analyzed part ${chunk.index + 1} of ${chunks.length}; ${candidates.length} candidates ready` });
+        continue;
+      }
+      savedChunk.status = "pending";
+      savedChunk.candidates = [];
+      savedChunk.error = "Saved candidate validation failed";
+    }
+
     await options.onProgress?.({ phase: "discovery", completed: chunk.index, total: chunks.length, message: `Analyzing part ${chunk.index + 1} of ${chunks.length}…` });
-    console.info(`[analysis] chunk=${chunk.index + 1}/${chunks.length} segments=${chunk.startSegment}-${chunk.endSegment} transcript_estimated_tokens=${chunk.estimatedTokens} chars=${chunk.characterCount}`);
+    console.info(`[analysis] chunk=${chunk.index + 1}/${chunks.length} checkpoint=${savedChunk.status} segments=${chunk.startSegment}-${chunk.endSegment} transcript_estimated_tokens=${chunk.estimatedTokens} chars=${chunk.characterCount}`);
     const prompt = buildUserPrompt({
-      transcriptBlock: chunk.block,
+      transcriptBlock: savedChunk.block,
       durationSec: options.durationSec,
       clipCount: options.clipCount,
       candidateCount: perChunk,
@@ -817,6 +1036,7 @@ export async function analyseTranscript(options: {
       chunkLabel: `${chunk.index + 1}/${chunks.length}, ${formatClock(chunk.startSec)}-${formatClock(chunk.endSec)}`,
       preferredVibes,
     });
+    const attemptStart = attempts.length;
     try {
       const result = await runWithFallback({
         user: prompt,
@@ -841,6 +1061,7 @@ export async function analyseTranscript(options: {
         },
         phase: "discovery",
         chunk: chunk.index,
+        jobId: options.jobId,
         attempts,
         unavailableProviders,
       });
@@ -849,22 +1070,43 @@ export async function analyseTranscript(options: {
       lastProvider = result.provider;
       lastModel = result.model;
       lastRaw = result.raw;
-      console.info(`[analysis] chunk ${chunk.index + 1}/${chunks.length}: ${result.provider}/${result.model} found ${found.length} candidate(s)`);
+      savedChunk.status = "succeeded";
+      savedChunk.candidates = found;
+      savedChunk.error = undefined;
+      console.info(`[analysis] chunk=${chunk.index + 1}/${chunks.length} provider=${result.provider} model=${result.model} checkpoint=saved candidates=${found.length}`);
     } catch (error) {
-      // One bad chunk must not discard candidates found elsewhere.
-      console.warn(`[analysis] chunk ${chunk.index + 1}/${chunks.length} exhausted providers: ${(error as Error).message}`);
+      failedChunks += 1;
+      savedChunk.status = "failed";
+      savedChunk.candidates = [];
+      savedChunk.error = (error as Error).message;
+      console.warn(`[analysis] chunk=${chunk.index + 1}/${chunks.length} checkpoint=failed providers=exhausted detail=${(error as Error).message}`);
     }
+    savedChunk.attempts.push(...attempts.slice(attemptStart));
+    checkpoint.provider = lastProvider;
+    checkpoint.model = lastModel;
+    checkpoint.raw = lastRaw;
+    checkpoint.updatedAt = new Date().toISOString();
+    await options.onCheckpoint?.(checkpoint);
     await options.onProgress?.({ phase: "discovery", completed: chunk.index + 1, total: chunks.length, message: `Analyzed part ${chunk.index + 1} of ${chunks.length}; ${candidates.length} candidates found` });
+  }
+
+  if (failedChunks) {
+    throw new AppError("rate_limited", `Analysis paused with ${failedChunks} transcript part(s) still incomplete.`, {
+      detail: `Successful transcript parts are saved. Retry this job to process only the failed part${failedChunks === 1 ? "" : "s"}.`,
+      status: 503,
+      retryable: true,
+    });
   }
 
   let ranked = deduplicateCandidates(candidates);
   if (!ranked.length) {
     throw new AppError("invalid_ai_output", "AI analysis could not find usable moments in the transcript.", {
-      detail: `All configured providers were unavailable or returned unusable results for ${chunks.length} transcript part(s). Please retry shortly or check the configured AI providers.`,
+      detail: `All configured providers returned unusable results for ${chunks.length} transcript part(s).`,
     });
   }
   console.info(`[analysis] discovery found ${candidates.length} candidate(s), ${ranked.length} after overlap deduplication`);
 
+  const selectionAttemptStart = attempts.length;
   if (chunks.length > 1 && ranked.length > options.clipCount) {
     await options.onProgress?.({ phase: "selection", completed: 0, total: 1, message: `Ranking ${ranked.length} promising moments…` });
     const prompt = selectionPrompt(ranked, options.clipCount, preferredVibes);
@@ -874,6 +1116,7 @@ export async function analyseTranscript(options: {
         schema: selectionJsonSchema,
         parse: (raw) => SelectionSchema.parse(extractJson(raw)),
         phase: "selection",
+        jobId: options.jobId,
         attempts,
         unavailableProviders,
       });
@@ -892,8 +1135,7 @@ export async function analyseTranscript(options: {
       lastRaw = result.raw;
       console.info(`[analysis] global selection used ${result.provider}/${result.model} and ranked ${selected.length} candidate(s)`);
     } catch (error) {
-      // Discovery scores remain a safe global ranking fallback.
-      console.warn(`[analysis] global AI selection failed; using discovery ranking: ${(error as Error).message}`);
+      console.warn(`[analysis] global AI selection failed; using persisted discovery ranking: ${(error as Error).message}`);
     }
   }
 
@@ -905,7 +1147,15 @@ export async function analyseTranscript(options: {
     requestedClips: options.clipCount,
     maxClipSec: options.maxClipSec,
   }).map(({ index: _index, words: _words, ...clip }) => clip);
-  console.info(`[analysis] final selection: ${final.length} clip(s) from ${chunks.length} chunk(s)`);
+  checkpoint.finalClips = final;
+  checkpoint.selectionComplete = true;
+  checkpoint.provider = lastProvider;
+  checkpoint.model = lastModel;
+  checkpoint.raw = lastRaw;
+  checkpoint.selectionAttempts = attempts.slice(selectionAttemptStart);
+  checkpoint.updatedAt = new Date().toISOString();
+  await options.onCheckpoint?.(checkpoint);
+  console.info(`[analysis] final selection: ${final.length} clip(s) from ${chunks.length} chunk(s), checkpoint=saved`);
   return {
     clips: final,
     provider: lastProvider,

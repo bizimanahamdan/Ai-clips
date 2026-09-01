@@ -1,3 +1,4 @@
+import type { AnalysisCheckpoint } from "@/lib/types";
 import {
   index,
   integer,
@@ -43,6 +44,8 @@ export const jobs = pgTable(
     language: text("language"),
     transcript: jsonb("transcript"),
     transcriptText: text("transcript_text"),
+    /** Resumable per-transcript-part AI analysis and final selection state. */
+    analysisCheckpoint: jsonb("analysis_checkpoint").$type<AnalysisCheckpoint>(),
 
     requestedClips: integer("requested_clips").notNull().default(3),
     maxClipSec: integer("max_clip_sec").notNull().default(45),
