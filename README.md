@@ -19,12 +19,12 @@ This application must **not** be deployed to Vercel/serverless. FFmpeg jobs can 
 
 ### Storage lifecycle
 
-* Browser uploads stream directly into the private R2 bucket; they are not retained on app disk.
-* A worker downloads the source from R2 into its job scratch directory immediately before processing.
+* Browser uploads stream directly into one canonical private-R2 key; that exact `sourceObjectKey` is HEAD-verified before the job row is created.
+* A worker HEAD-checks and downloads only the persisted `sourceObjectKey` into its job scratch directory immediately before processing; it never reconstructs an upload key.
 * Direct public video URLs are acquired through the source-provider layer directly into the active job's scratch directory. They are not retained in R2 unless `PERSIST_URL_SOURCES=true`.
 * Each rendered clip and poster is uploaded to R2 immediately, then its local copy is deleted.
 * The entire scratch directory and local source are removed in the pipeline `finally` block on success or failure.
-* The existing retention cleanup deletes expired database rows and their R2 source/clip/poster objects. Set `RETENTION_HOURS` to the desired product retention period.
+* Completed jobs retain their source and outputs until `RETENTION_HOURS` expires. Failed/partial jobs retain their source and database row for safe retry; explicit user deletion still removes their objects. Retention cleanup removes database references before deleting completed-job R2 objects, so a cleanup failure cannot leave a live job pointing at a deleted key.
 * Clip playback/download keeps the existing same-origin API URL. The API streams the private R2 object and supports HTTP Range requests.
 
 ## Local development

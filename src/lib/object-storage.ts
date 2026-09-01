@@ -125,7 +125,7 @@ export async function uploadRequestToR2(options: {
   } catch (error) {
     input.destroy();
     limiter.destroy();
-    await deleteObject(options.key).catch(() => undefined);
+    await deleteObject(options.key, "incomplete-upload-rollback").catch(() => undefined);
     throw error;
   }
 }
@@ -165,23 +165,53 @@ export async function getObject(key: string, range?: string | null) {
   );
 }
 
-export async function objectExists(key: string): Promise<boolean> {
+export type R2ObjectMetadata = {
+  exists: boolean;
+  key: string;
+  sizeBytes: number | null;
+  contentType: string | null;
+  etag: string | null;
+};
+
+function isMissingObjectError(error: unknown): boolean {
+  const typed = error as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+  return typed.$metadata?.httpStatusCode === 404 || typed.name === "NotFound" || typed.name === "NoSuchKey" || typed.Code === "NoSuchKey";
+}
+
+/** HEAD the exact key. Callers must never derive a replacement during restore. */
+export async function headObject(key: string): Promise<R2ObjectMetadata> {
   try {
-    await r2().send(new HeadObjectCommand({ Bucket: config.r2BucketName, Key: key }));
-    return true;
+    const result = await r2().send(new HeadObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+    return {
+      exists: true,
+      key,
+      sizeBytes: typeof result.ContentLength === "number" ? result.ContentLength : null,
+      contentType: result.ContentType ?? null,
+      etag: result.ETag ?? null,
+    };
   } catch (error) {
-    const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
-    if (status === 404) return false;
+    if (isMissingObjectError(error)) {
+      return { exists: false, key, sizeBytes: null, contentType: null, etag: null };
+    }
     throw error;
   }
 }
 
-export async function deleteObject(key: string): Promise<void> {
-  await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+export async function objectExists(key: string): Promise<boolean> {
+  return (await headObject(key)).exists;
 }
 
-export async function deleteObjects(keys: Array<string | null | undefined>): Promise<void> {
-  await Promise.all(keys.filter((key): key is string => Boolean(key)).map((key) => deleteObject(key)));
+export async function deleteObject(key: string, reason = "unspecified"): Promise<void> {
+  await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+  console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=deleted reason=${reason}`);
+}
+
+export async function deleteObjects(
+  keys: Array<string | null | undefined>,
+  reason = "unspecified",
+): Promise<void> {
+  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+  await Promise.all(uniqueKeys.map((key) => deleteObject(key, reason)));
 }
 
 /** Remove browser-uploaded music that was never attached to a job. */
@@ -199,7 +229,7 @@ export async function deletePendingMusicOlderThan(cutoff: Date, protectedKeys: R
         item.Key && item.LastModified && item.LastModified < cutoff && !protectedKeys.has(item.Key),
       ),
     );
-    await deleteObjects(stale.map((item) => item.Key));
+    await deleteObjects(stale.map((item) => item.Key), "expired-pending-music");
     removed += stale.length;
     continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
   } while (continuationToken);

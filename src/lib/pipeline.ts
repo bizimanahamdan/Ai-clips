@@ -122,9 +122,15 @@ export async function runPipeline(jobId: string): Promise<void> {
       ).catch(() => undefined);
     });
     const sourcePath = acquired.localPath;
+    if (job.sourceObjectKey && acquired.durableObjectKey !== job.sourceObjectKey) {
+      throw new AppError("internal", "Source storage key changed during acquisition.", {
+        detail: `job=${job.id} persisted=${job.sourceObjectKey} acquired=${acquired.durableObjectKey ?? "none"}`,
+      });
+    }
+    const authoritativeSourceObjectKey = job.sourceObjectKey ?? acquired.durableObjectKey;
     await patchJob(ctx, {
       filePath: sourcePath,
-      sourceObjectKey: acquired.durableObjectKey,
+      sourceObjectKey: authoritativeSourceObjectKey,
       fileSizeBytes: acquired.sizeBytes,
       sourceName: acquired.fileName,
     });
@@ -448,8 +454,10 @@ export async function runPipeline(jobId: string): Promise<void> {
       stageDetail: `${readyCount} clip(s) ready${failedCount ? `, ${failedCount} failed` : ""}`,
       progress: 100,
       finishedAt: new Date(),
-      expiresAt: new Date(Date.now() + config.retentionHours * 3600 * 1000),
+      expiresAt: status === "completed" ? new Date(Date.now() + config.retentionHours * 3600 * 1000) : null,
     });
+    console.info(`[R2 cleanup] key=${authoritativeSourceObjectKey ?? "none"} action=kept reason=${status}-retention-window job=${jobId}`);
+    console.info(`[job complete] job=${jobId} sourceObjectKey=${authoritativeSourceObjectKey ?? "none"} outputs=${readyCount} status=${status}`);
     await log(ctx, "info", "done", `Job finished: ${readyCount} ready, ${failedCount} failed.`);
   } catch (error) {
     const payload = toErrorPayload(error);
@@ -460,7 +468,15 @@ export async function runPipeline(jobId: string): Promise<void> {
       stageDetail: payload.message,
       error: { message: payload.message, stage: "pipeline", detail: payload.detail, kind: payload.kind },
       finishedAt: new Date(),
+      expiresAt: null,
     });
+    const [failedSource] = await db
+      .select({ sourceObjectKey: jobs.sourceObjectKey })
+      .from(jobs)
+      .where(eq(jobs.id, jobId))
+      .limit(1)
+      .catch(() => []);
+    console.info(`[R2 cleanup] key=${failedSource?.sourceObjectKey ?? "none"} action=kept reason=job-failed-retryable job=${jobId}`);
     await log(ctx, "error", "failed", `${payload.message}${payload.detail ? ` — ${payload.detail.slice(0, 800)}` : ""}`);
     throw error;
   } finally {

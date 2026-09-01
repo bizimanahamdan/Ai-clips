@@ -3,7 +3,7 @@ import path from "node:path";
 import { config } from "./config";
 import { AppError } from "./errors";
 import { downloadFromUrl, sanitizeFileName } from "./ingest";
-import { deleteObject, downloadObjectToFile, sourceObjectKey, uploadFileToR2 } from "./object-storage";
+import { downloadObjectToFile, headObject, sourceObjectKey, uploadFileToR2 } from "./object-storage";
 
 export type VideoSourceKind = "upload" | "direct_url" | "dropbox" | "google_drive" | "url";
 export type VideoSourceProviderName = "upload" | "direct_url" | "dropbox" | "google_drive";
@@ -106,6 +106,39 @@ function googleDriveDownloadUrl(value: string): string {
   return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`;
 }
 
+async function restorePersistedSource(
+  job: VideoSourceJob,
+  workDir: string,
+  provider: VideoSourceProviderName,
+): Promise<AcquiredVideo | null> {
+  const key = job.sourceObjectKey;
+  if (!key) return null;
+  console.info(`[R2 restore] bucket=${config.r2BucketName} key=${key} job=${job.id} media=${job.sourceName}`);
+  const metadata = await headObject(key);
+  console.info(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${key} job=${job.id} exists=${metadata.exists} size=${metadata.sizeBytes ?? "unknown"} contentType=${metadata.contentType ?? "unknown"}`);
+  if (!metadata.exists) return null;
+
+  const extension = path.extname(job.sourceName) || ".mp4";
+  const localPath = path.join(workDir, `source${extension}`);
+  await downloadObjectToFile(key, localPath);
+  const { size } = await fsp.stat(localPath);
+  if (metadata.sizeBytes !== null && size !== metadata.sizeBytes) {
+    await fsp.rm(localPath, { force: true });
+    throw new AppError("download_failed", "The restored R2 source video size did not match its metadata.", {
+      detail: `job=${job.id} sourceObjectKey=${key} expected=${metadata.sizeBytes} downloaded=${size}`,
+      status: 502,
+    });
+  }
+  return {
+    localPath,
+    fileName: sanitizeFileName(job.sourceName),
+    sizeBytes: size,
+    contentType: metadata.contentType,
+    durableObjectKey: key,
+    provider,
+  };
+}
+
 async function acquireRemote(
   job: VideoSourceJob,
   workDir: string,
@@ -113,12 +146,12 @@ async function acquireRemote(
   resolveUrl: (value: string) => string,
   onProgress?: AcquisitionProgress,
 ): Promise<AcquiredVideo> {
-  if (config.persistUrlSources && job.sourceObjectKey) {
-    const extension = path.extname(job.sourceName) || ".mp4";
-    const localPath = path.join(workDir, `source${extension}`);
-    await downloadObjectToFile(job.sourceObjectKey, localPath);
-    const { size } = await fsp.stat(localPath);
-    return { localPath, fileName: sanitizeFileName(job.sourceName), sizeBytes: size, contentType: null, durableObjectKey: job.sourceObjectKey, provider };
+  // A persisted database key is authoritative regardless of the current
+  // PERSIST_URL_SOURCES setting. This also makes retries safe across config changes.
+  if (job.sourceObjectKey) {
+    const restored = await restorePersistedSource(job, workDir, provider);
+    if (restored) return restored;
+    console.warn(`[R2 restore] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} missing=true action=redownload-same-key`);
   }
   if (!job.sourceUrl) throw new AppError("bad_request", `This ${provider.replace("_", " ")} job has no source URL.`);
   const downloaded = await downloadFromUrl({
@@ -128,11 +161,21 @@ async function acquireRemote(
     onProgress,
   });
   let durableObjectKey: string | null = null;
-  if (config.persistUrlSources) {
+  if (config.persistUrlSources || job.sourceObjectKey) {
+    // Reuse a persisted key exactly. Generate a key only for the first durable
+    // acquisition of a URL source, never during a later restore.
     durableObjectKey = job.sourceObjectKey || sourceObjectKey(job.id, downloaded.fileName);
-    await uploadFileToR2(downloaded.filePath, durableObjectKey, downloaded.contentType || "application/octet-stream");
-  } else if (job.sourceObjectKey) {
-    await deleteObject(job.sourceObjectKey).catch(() => undefined);
+    const contentType = downloaded.contentType || "application/octet-stream";
+    await uploadFileToR2(downloaded.filePath, durableObjectKey, contentType);
+    console.info(`[R2 upload] bucket=${config.r2BucketName} key=${durableObjectKey} size=${downloaded.sizeBytes} contentType=${contentType} job=${job.id}`);
+    const verified = await headObject(durableObjectKey);
+    console.info(`[R2 verify-upload] bucket=${config.r2BucketName} key=${durableObjectKey} exists=${verified.exists} size=${verified.sizeBytes ?? "unknown"} contentType=${verified.contentType ?? "unknown"} job=${job.id}`);
+    if (!verified.exists || (verified.sizeBytes !== null && verified.sizeBytes !== downloaded.sizeBytes)) {
+      throw new AppError("internal", "Could not verify the durable URL source in Cloudflare R2.", {
+        detail: `job=${job.id} sourceObjectKey=${durableObjectKey} local=${downloaded.sizeBytes} stored=${verified.sizeBytes ?? "missing"}`,
+        status: 502,
+      });
+    }
   }
   return {
     localPath: downloaded.filePath,
@@ -151,11 +194,15 @@ const uploadAdapter: VideoSourceAdapter = {
     if (!job.sourceObjectKey) {
       throw new AppError("unsupported_media", "The uploaded source video is missing from Cloudflare R2. Please upload it again.", { status: 410 });
     }
-    const extension = path.extname(job.sourceName) || ".mp4";
-    const localPath = path.join(workDir, `source${extension}`);
-    await downloadObjectToFile(job.sourceObjectKey, localPath);
-    const { size } = await fsp.stat(localPath);
-    return { localPath, fileName: sanitizeFileName(job.sourceName), sizeBytes: size, contentType: null, durableObjectKey: job.sourceObjectKey, provider: "upload" };
+    const restored = await restorePersistedSource(job, workDir, "upload");
+    if (!restored) {
+      console.error(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} exists=false databaseField=sourceObjectKey`);
+      throw new AppError("download_failed", "The uploaded source video no longer exists at its persisted Cloudflare R2 key.", {
+        detail: `job=${job.id} media=${job.sourceName} sourceObjectKey=${job.sourceObjectKey}. The exact database key was checked; bucket contents at other keys do not satisfy this job.`,
+        status: 410,
+      });
+    }
+    return restored;
   },
 };
 

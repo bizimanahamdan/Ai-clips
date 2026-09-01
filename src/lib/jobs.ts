@@ -12,7 +12,7 @@ import {
   jobRoot,
   removePath,
 } from "./storage";
-import { checkR2, deleteObjects, deletePendingMusicOlderThan, objectExists } from "./object-storage";
+import { checkR2, deleteObjects, deletePendingMusicOlderThan, headObject, sourceObjectKey } from "./object-storage";
 import { normalizeOutputFormat, type OutputFormat } from "./output-format";
 import { normalizeAssetIds, normalizeMediaMode, resolveJobAssets, type MediaMode } from "./media-library";
 import type { ApiJob, JobStatus, Stage } from "./types";
@@ -65,8 +65,13 @@ async function boot(): Promise<void> {
       enqueue(job.id);
       continue;
     }
-    // A URL can be downloaded again; an upload can resume from durable R2.
-    const sourceAlive = ["direct_url", "dropbox", "google_drive", "url"].includes(job.sourceType) || (job.sourceObjectKey ? await objectExists(job.sourceObjectKey) : false);
+    // A URL can be downloaded again; an upload can resume only from its exact durable key.
+    const remoteSource = ["direct_url", "dropbox", "google_drive", "url"].includes(job.sourceType);
+    const sourceMetadata = job.sourceObjectKey ? await headObject(job.sourceObjectKey) : null;
+    if (job.sourceObjectKey) {
+      console.info(`[R2 verify-before-download] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${job.id} exists=${sourceMetadata?.exists ?? false} action=startup-recovery`);
+    }
+    const sourceAlive = remoteSource || sourceMetadata?.exists === true;
     if (sourceAlive) {
       // Durable source survived the restart: requeue from the beginning.
       await db
@@ -99,6 +104,7 @@ async function boot(): Promise<void> {
             stage: "processing",
           },
           finishedAt: new Date(),
+          expiresAt: null,
         })
         .where(eq(jobs.id, job.id));
       await db.insert(jobEvents).values({
@@ -166,6 +172,7 @@ function pump(): void {
             stageDetail: payload.message,
             error: { kind: payload.kind, message: payload.message, detail: payload.detail, stage: "queue" },
             finishedAt: new Date(),
+            expiresAt: null,
             updatedAt: new Date(),
           }).where(eq(jobs.id, jobId)).catch(() => undefined);
           await db.insert(jobEvents).values({
@@ -197,11 +204,12 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
   const cutoff = new Date(Date.now() - config.retentionHours * 3600 * 1000);
 
   const expired = await db
-    .select({ id: jobs.id, expiresAt: jobs.expiresAt })
+    .select({ id: jobs.id, status: jobs.status, expiresAt: jobs.expiresAt })
     .from(jobs)
     .where(lt(jobs.createdAt, cutoff));
 
   const removable = expired.filter((job) => {
+    if (job.status !== "completed") return false;
     if (job.expiresAt && job.expiresAt.getTime() > Date.now()) return false;
     return true;
   });
@@ -216,11 +224,14 @@ export async function runCleanup(): Promise<{ removedJobs: number; removedDirs: 
       .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
       .from(clips)
       .where(inArray(clips.jobId, ids));
-    await deleteObjects([
+    const expiredObjectKeys = [
       ...sources.flatMap((item) => [item.key, item.musicKey]),
       ...storedClips.flatMap((item) => [item.key, item.posterKey]),
-    ]);
+    ];
+    // Remove authoritative database references first. If an R2 delete then
+    // fails, it leaves an orphan object rather than a live job with NoSuchKey.
     await db.delete(jobs).where(inArray(jobs.id, ids));
+    await deleteObjects(expiredObjectKeys, "completed-job-retention-expired");
   }
 
   const { purgeExpiredJobs } = await import("./storage");
@@ -283,12 +294,38 @@ export async function createJob(input: CreateJobInput): Promise<string> {
   );
 
   const mediaMode = normalizeMediaMode(input.mediaMode);
+  const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const remoteSource = input.sourceType !== "upload";
+  const authoritativeSourceKey = input.sourceObjectKey
+    ?? (remoteSource && config.persistUrlSources ? sourceObjectKey(id, input.sourceName) : null);
+  let authoritativeSourceSize = input.fileSizeBytes ?? null;
+  if (input.sourceType === "upload") {
+    if (!authoritativeSourceKey) {
+      throw new AppError("internal", "Uploaded video has no persisted R2 source key.");
+    }
+    const uploaded = await headObject(authoritativeSourceKey);
+    console.info(
+      `[R2 verify-upload] bucket=${config.r2BucketName} key=${authoritativeSourceKey} exists=${uploaded.exists} size=${uploaded.sizeBytes ?? "unknown"} contentType=${uploaded.contentType ?? "unknown"}`,
+    );
+    if (!uploaded.exists) {
+      throw new AppError("download_failed", "Cloudflare R2 did not confirm the uploaded source video.", {
+        detail: `job=${id} sourceObjectKey=${authoritativeSourceKey}`,
+        status: 502,
+      });
+    }
+    if (uploaded.sizeBytes !== null && input.fileSizeBytes !== null && input.fileSizeBytes !== undefined && uploaded.sizeBytes !== input.fileSizeBytes) {
+      throw new AppError("internal", "Cloudflare R2 reported an unexpected source-video size after upload.", {
+        detail: `job=${id} sourceObjectKey=${authoritativeSourceKey} streamed=${input.fileSizeBytes} stored=${uploaded.sizeBytes}`,
+        status: 502,
+      });
+    }
+    authoritativeSourceSize = uploaded.sizeBytes ?? authoritativeSourceSize;
+  }
   const selectedAssets = await resolveJobAssets({
     mediaMode,
     musicIds: normalizeAssetIds(input.musicAssetIds),
     soundEffectIds: normalizeAssetIds(input.soundEffectAssetIds),
   });
-  const id = input.id ?? `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await db.transaction(async (tx) => {
     await tx.insert(jobs).values({
       id,
@@ -298,8 +335,8 @@ export async function createJob(input: CreateJobInput): Promise<string> {
       sourceName: input.sourceName.slice(0, 200),
       sourceUrl: input.sourceUrl ?? null,
       filePath: input.filePath ?? null,
-      sourceObjectKey: input.sourceObjectKey ?? null,
-      fileSizeBytes: input.fileSizeBytes ?? null,
+      sourceObjectKey: authoritativeSourceKey,
+      fileSizeBytes: authoritativeSourceSize,
       requestedClips,
       maxClipSec,
       subtitlesEnabled: input.subtitlesEnabled === false ? 0 : 1,
@@ -325,9 +362,10 @@ export async function createJob(input: CreateJobInput): Promise<string> {
       message:
         input.sourceType !== "upload"
           ? `${input.sourceType.replace("_", " ")} job queued: ${input.sourceUrl}`
-          : `Job queued for upload: ${input.sourceName} (${((input.fileSizeBytes ?? 0) / (1024 * 1024)).toFixed(1)}MB)`,
+          : `Job queued for upload: ${input.sourceName} (${((authoritativeSourceSize ?? 0) / (1024 * 1024)).toFixed(1)}MB), sourceObjectKey=${authoritativeSourceKey}`,
     });
   });
+  console.info(`[job create] job=${id} sourceType=${input.sourceType} sourceObjectKey=${authoritativeSourceKey ?? "none"}`);
   enqueue(id);
   return id;
 }
@@ -474,12 +512,14 @@ export async function deleteJob(jobId: string): Promise<void> {
     .select({ key: clips.objectKey, posterKey: clips.posterObjectKey })
     .from(clips)
     .where(eq(clips.jobId, jobId));
-  await deleteObjects([
+  const objectKeys = [
     job.sourceObjectKey,
     job.musicObjectKey,
     ...storedClips.flatMap((item) => [item.key, item.posterKey]),
-  ]);
+  ];
   await db.delete(jobs).where(eq(jobs.id, jobId));
+  await deleteObjects(objectKeys, "user-deleted-job")
+    .catch((error) => console.warn(`[R2 cleanup] job=${jobId} action=kept reason=user-delete-object-failed detail=${(error as Error).message}`));
   await removePath(jobRoot(jobId));
 }
 

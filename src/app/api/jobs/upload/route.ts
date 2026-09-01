@@ -15,6 +15,7 @@ export const maxDuration = 300;
 /** Upload the raw request body directly to durable R2 storage. */
 export async function POST(request: Request) {
   let uploadedKey: string | null = null;
+  let sourceAttachedToJob = false;
   let pendingMusicKey: string | null = null;
   try {
     await ensureRuntime();
@@ -34,12 +35,14 @@ export async function POST(request: Request) {
 
     const jobId = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     uploadedKey = sourceObjectKey(jobId, fileName);
+    const contentType = request.headers.get("content-type") || "application/octet-stream";
     const sizeBytes = await uploadRequestToR2({
       body: request.body,
       key: uploadedKey,
       maxBytes: config.maxUploadMb * 1024 * 1024,
-      contentType: request.headers.get("content-type"),
+      contentType,
     });
+    console.info(`[R2 upload] bucket=${config.r2BucketName} key=${uploadedKey} size=${sizeBytes} contentType=${contentType}`);
 
     await createJob({
       id: jobId,
@@ -58,11 +61,14 @@ export async function POST(request: Request) {
       musicAssetIds,
       soundEffectAssetIds,
     });
+    sourceAttachedToJob = true;
     pendingMusicKey = null;
     return NextResponse.json({ jobId, sizeBytes }, { status: 202 });
   } catch (error) {
-    if (uploadedKey) await deleteObject(uploadedKey).catch(() => undefined);
-    if (pendingMusicKey) await deleteObject(pendingMusicKey).catch(() => undefined);
+    if (uploadedKey && !sourceAttachedToJob) {
+      await deleteObject(uploadedKey, "upload-not-attached-to-job").catch(() => undefined);
+    }
+    if (pendingMusicKey) await deleteObject(pendingMusicKey, "pending-music-job-create-failed").catch(() => undefined);
     const payload = toErrorPayload(error);
     return NextResponse.json(
       { error: payload.message, kind: payload.kind, detail: payload.detail },
