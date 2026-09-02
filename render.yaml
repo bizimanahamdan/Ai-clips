@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: clipforge
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clipforge-postgres
+          property: connectionString
+      - key: R2_BUCKET_NAME
+        value: my-clips-storage
+      - key: STORAGE_DIR
+        value: /tmp/clipforge
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: NODE_ENV
+        value: production
+
+databases:
+  - name: clipforge-postgres
+    databaseName: clipforge
+    user: clipforge

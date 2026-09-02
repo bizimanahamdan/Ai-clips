@@ -1,0 +1,296 @@
+import { createReadStream, createWriteStream } from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  S3Client,
+} from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import { config } from "./config";
+import { AppError } from "./errors";
+
+let client: S3Client | null = null;
+
+export function r2Configured(): boolean {
+  return Boolean(
+    config.r2AccountId &&
+      config.r2AccessKeyId &&
+      config.r2SecretAccessKey &&
+      config.r2BucketName &&
+      config.r2Endpoint,
+  );
+}
+
+function r2(): S3Client {
+  if (!r2Configured()) {
+    throw new AppError("internal", "Cloudflare R2 is not configured.", {
+      detail:
+        "Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, and R2_ENDPOINT.",
+    });
+  }
+  client ??= new S3Client({
+    region: "auto",
+    endpoint: config.r2Endpoint,
+    credentials: {
+      accessKeyId: config.r2AccessKeyId,
+      secretAccessKey: config.r2SecretAccessKey,
+    },
+  });
+  return client;
+}
+
+export function sourceObjectKey(jobId: string, fileName: string): string {
+  const extension = fileName.match(/\.[a-zA-Z0-9]{1,8}$/)?.[0]?.toLowerCase() || ".mp4";
+  return `jobs/${jobId}/source${extension}`;
+}
+
+export function clipObjectKey(jobId: string, fileName: string): string {
+  return `jobs/${jobId}/clips/${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+}
+
+export function mediaLibraryObjectKey(assetId: string, fileName: string): string {
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "audio.bin";
+  return `media-library/${assetId}/${safeName}`;
+}
+
+export function pendingMusicObjectKey(fileName: string): string {
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-100) || "music.mp3";
+  return `pending-music/${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeName}`;
+}
+
+async function uploadBody(
+  key: string,
+  body: Readable,
+  contentType: string,
+): Promise<void> {
+  try {
+    const upload = new Upload({
+      client: r2(),
+      params: {
+        Bucket: config.r2BucketName,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      },
+      // One in-flight multipart chunk keeps memory predictable on a 512 MB host.
+      queueSize: 1,
+      partSize: 8 * 1024 * 1024,
+      leavePartsOnError: false,
+    });
+    await upload.done();
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError("internal", "Could not upload media to Cloudflare R2.", {
+      detail: (error as Error).message,
+      status: 502,
+    });
+  }
+}
+
+/** Stream a browser upload directly to R2 without retaining it on app disk. */
+export async function uploadRequestToR2(options: {
+  body: ReadableStream<Uint8Array> | null;
+  key: string;
+  maxBytes: number;
+  contentType?: string | null;
+}): Promise<number> {
+  if (!options.body) throw new AppError("bad_request", "Upload body was empty.");
+  let bytes = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.byteLength;
+      if (bytes > options.maxBytes) {
+        callback(
+          new AppError(
+            "too_large",
+            `Upload is larger than the ${Math.round(options.maxBytes / 1024 / 1024)}MB limit.`,
+            { status: 413 },
+          ),
+        );
+      } else callback(null, chunk);
+    },
+  });
+  const input = Readable.fromWeb(options.body as Parameters<typeof Readable.fromWeb>[0]);
+  input.pipe(limiter);
+  try {
+    await uploadBody(options.key, limiter, options.contentType || "application/octet-stream");
+    if (!bytes) throw new AppError("bad_request", "Uploaded file was empty.");
+    return bytes;
+  } catch (error) {
+    input.destroy();
+    limiter.destroy();
+    await deleteObject(options.key, "incomplete-upload-rollback").catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function uploadFileToR2(
+  filePath: string,
+  key: string,
+  contentType = "application/octet-stream",
+): Promise<void> {
+  await uploadBody(key, createReadStream(filePath), contentType);
+}
+
+export async function downloadObjectToFile(
+  key: string,
+  target: string,
+  context: { label?: string; kind?: "source" | "clip" | "media"; jobId?: string; stage?: string } = {},
+): Promise<void> {
+  const label = context.label || (context.kind === "source" ? "persisted source video" : context.kind === "clip" ? "rendered clip" : context.kind === "media" ? "media asset" : "object");
+  try {
+    const result = await r2().send(
+      new GetObjectCommand({ Bucket: config.r2BucketName, Key: key }),
+    );
+    if (!result.Body) throw new Error("R2 returned an empty response body");
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await pipeline(result.Body as Readable, createWriteStream(target));
+  } catch (error) {
+    await fsp.rm(target, { force: true });
+    if (isMissingObjectError(error)) {
+      throw new AppError("source_object_missing", `The exact ${label} does not exist in Cloudflare R2.`, {
+        detail: [`key=${key}`, context.jobId && `jobId=${context.jobId}`, context.stage && `stage=${context.stage}`].filter(Boolean).join("; "),
+        status: 410,
+      });
+    }
+    throw new AppError("download_failed", `Could not download the ${label} from Cloudflare R2.`, {
+      detail: [`key=${key}`, context.jobId && `jobId=${context.jobId}`, context.stage && `stage=${context.stage}`, (error as Error).message].filter(Boolean).join("; "),
+      status: 502,
+    });
+  }
+}
+
+export async function getObject(key: string, range?: string | null) {
+  return r2().send(
+    new GetObjectCommand({
+      Bucket: config.r2BucketName,
+      Key: key,
+      Range: range || undefined,
+    }),
+  );
+}
+
+export type R2ObjectMetadata = {
+  exists: boolean;
+  key: string;
+  sizeBytes: number | null;
+  contentType: string | null;
+  etag: string | null;
+};
+
+function isMissingObjectError(error: unknown): boolean {
+  const typed = error as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+  return typed.$metadata?.httpStatusCode === 404 || typed.name === "NotFound" || typed.name === "NoSuchKey" || typed.Code === "NoSuchKey";
+}
+
+/** HEAD the exact key. Callers must never derive a replacement during restore. */
+export async function headObject(key: string): Promise<R2ObjectMetadata> {
+  try {
+    const result = await r2().send(new HeadObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+    return {
+      exists: true,
+      key,
+      sizeBytes: typeof result.ContentLength === "number" ? result.ContentLength : null,
+      contentType: result.ContentType ?? null,
+      etag: result.ETag ?? null,
+    };
+  } catch (error) {
+    if (isMissingObjectError(error)) {
+      return { exists: false, key, sizeBytes: null, contentType: null, etag: null };
+    }
+    throw error;
+  }
+}
+
+export type R2ListedObject = {
+  key: string;
+  sizeBytes: number;
+  lastModified: Date | null;
+  etag: string | null;
+};
+
+export async function listObjectsPage(options: {
+  prefix?: string;
+  delimiter?: string;
+  continuationToken?: string;
+  maxKeys?: number;
+}): Promise<{ objects: R2ListedObject[]; prefixes: string[]; nextToken: string | null }> {
+  const result = await r2().send(new ListObjectsV2Command({
+    Bucket: config.r2BucketName,
+    Prefix: options.prefix || undefined,
+    Delimiter: options.delimiter,
+    ContinuationToken: options.continuationToken,
+    MaxKeys: Math.max(1, Math.min(1000, options.maxKeys ?? 100)),
+  }));
+  return {
+    objects: (result.Contents ?? []).filter((item): item is typeof item & { Key: string } => Boolean(item.Key)).map((item) => ({
+      key: item.Key,
+      sizeBytes: item.Size ?? 0,
+      lastModified: item.LastModified ?? null,
+      etag: item.ETag ?? null,
+    })),
+    prefixes: (result.CommonPrefixes ?? []).flatMap((item) => item.Prefix ? [item.Prefix] : []),
+    nextToken: result.IsTruncated ? result.NextContinuationToken ?? null : null,
+  };
+}
+
+export async function objectExists(key: string): Promise<boolean> {
+  return (await headObject(key)).exists;
+}
+
+export async function deleteObject(key: string, reason = "unspecified"): Promise<void> {
+  try {
+    await r2().send(new DeleteObjectCommand({ Bucket: config.r2BucketName, Key: key }));
+    console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=deleted reason=${reason}`);
+  } catch (error) {
+    // S3 DeleteObject is normally idempotent; tolerate providers that surface
+    // an explicit missing-key response so cleanup/retry can safely run again.
+    if (isMissingObjectError(error)) {
+      console.info(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=already-missing reason=${reason}`);
+      return;
+    }
+    console.error(`[R2 cleanup] bucket=${config.r2BucketName} key=${key} action=delete-failed reason=${reason} error=${(error as Error).message}`);
+    throw error;
+  }
+}
+
+export async function deleteObjects(
+  keys: Array<string | null | undefined>,
+  reason = "unspecified",
+): Promise<void> {
+  const uniqueKeys = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+  await Promise.all(uniqueKeys.map((key) => deleteObject(key, reason)));
+}
+
+/** Remove browser-uploaded music that was never attached to a job. */
+export async function deletePendingMusicOlderThan(cutoff: Date, protectedKeys: ReadonlySet<string> = new Set()): Promise<number> {
+  let continuationToken: string | undefined;
+  let removed = 0;
+  do {
+    const page = await r2().send(new ListObjectsV2Command({
+      Bucket: config.r2BucketName,
+      Prefix: "pending-music/",
+      ContinuationToken: continuationToken,
+    }));
+    const stale = (page.Contents ?? []).filter(
+      (item): item is typeof item & { Key: string } => Boolean(
+        item.Key && item.LastModified && item.LastModified < cutoff && !protectedKeys.has(item.Key),
+      ),
+    );
+    await deleteObjects(stale.map((item) => item.Key), "expired-pending-music");
+    removed += stale.length;
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return removed;
+}
+
+export async function checkR2(): Promise<{ bucket: string; endpoint: string }> {
+  await r2().send(new HeadBucketCommand({ Bucket: config.r2BucketName }));
+  return { bucket: config.r2BucketName, endpoint: config.r2Endpoint };
+}

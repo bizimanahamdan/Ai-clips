@@ -3,9 +3,9 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ClipForge — AI vertical clip generator",
+  title: "ClipForge — AI clip generator",
   description:
-    "Upload a long video, get vertical 9:16 clips with AI-picked moments and burned-in captions.",
+    "Create AI-picked clips in multiple formats with captions and reusable media-library audio.",
 };
 
 export const viewport: Viewport = {

@@ -5,6 +5,7 @@ import { checkBinaries } from "@/lib/ffmpeg";
 import { providersConfigured } from "@/lib/config";
 import { ensureRuntime, queueSnapshot } from "@/lib/jobs";
 import { storageRoot } from "@/lib/storage";
+import { checkR2 } from "@/lib/object-storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +33,7 @@ export async function GET() {
   try {
     const providers = providersConfigured();
     checks.providers = {
+      gemini: providers.gemini ? "configured" : "missing GEMINI_API_KEY or GEMINI_TEXT_MODEL",
       groq: providers.groq ? "configured" : "missing GROQ_API_KEY",
       openrouter: providers.openrouter ? "configured" : "missing OPENROUTER_API_KEY",
       order: providers.order,
@@ -41,17 +43,25 @@ export async function GET() {
     checks.providers = `error: ${(error as Error).message}`;
   }
 
-  checks.storage = storageRoot();
+  checks.temporaryStorage = storageRoot();
+
+  try {
+    checks.r2 = await checkR2();
+  } catch (error) {
+    ok = false;
+    checks.r2 = `error: ${(error as Error).message}`;
+  }
 
   try {
     await ensureRuntime();
     checks.queue = queueSnapshot();
   } catch (error) {
+    ok = false;
     checks.queue = `error: ${(error as Error).message}`;
   }
 
   return NextResponse.json(
     { status: ok ? "ok" : "degraded", checks, timestamp: new Date().toISOString() },
-    { status: 200 },
+    { status: ok ? 200 : 503 },
   );
 }

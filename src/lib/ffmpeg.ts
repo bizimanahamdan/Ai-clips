@@ -2,74 +2,11 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { AppError } from "./errors";
 
-/**
- * Binary resolution.
- *
- * Bundlers rewrite `__dirname`, which breaks ffmpeg-static's own path lookup
- * (it ends up as /ROOT/node_modules/...). So we resolve explicitly:
- *   1. explicit env override (FFMPEG_PATH / FFPROBE_PATH)
- *   2. the npm static binaries inside node_modules, verified on disk
- *   3. whatever is on PATH
- */
-function firstExisting(candidates: string[]): string | null {
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      /* ignore */
-    }
-  }
-  return null;
-}
-
-function whichSync(bin: string): string | null {
-  try {
-    const out = execFileSync("which", [bin], { encoding: "utf8" }).trim();
-    return out && fs.existsSync(out) ? out : null;
-  } catch {
-    return null;
-  }
-}
-
-const binaryCache = new Map<string, string>();
-
+/** Docker installs system binaries; local hosts may override their paths. */
 function resolveBinary(kind: "ffmpeg" | "ffprobe"): string {
-  const cached = binaryCache.get(kind);
-  if (cached) return cached;
-
-  const override = process.env[kind === "ffmpeg" ? "FFMPEG_PATH" : "FFPROBE_PATH"];
-  if (override && fs.existsSync(override)) return override;
-
-  const roots = [process.cwd(), path.join(process.cwd(), ".."), "/app", "/app/server"];
-  const staticCandidates: string[] = [];
-  for (const root of roots) {
-    if (kind === "ffmpeg") {
-      staticCandidates.push(path.join(root, "node_modules", "ffmpeg-static", kind));
-    } else {
-      staticCandidates.push(
-        path.join(root, "node_modules", "ffprobe-static", "bin", process.platform, process.arch, "ffprobe"),
-        path.join(root, "node_modules", "ffprobe-static", "bin", process.platform, "x64", "ffprobe"),
-      );
-    }
-  }
-
-  const resolved = firstExisting(staticCandidates) ?? whichSync(kind);
-  if (!resolved) {
-    throw new AppError(
-      "ffmpeg_error",
-      `Could not find a usable ${kind} binary on this server.`,
-      {
-        detail:
-          "Install it (apt-get install -y ffmpeg) or keep node_modules/ffmpeg-static present, or set FFMPEG_PATH / FFPROBE_PATH.",
-      },
-    );
-  }
-  binaryCache.set(kind, resolved);
-  return resolved;
+  return process.env[kind === "ffmpeg" ? "FFMPEG_PATH" : "FFPROBE_PATH"]?.trim() || kind;
 }
 
 /**
@@ -304,6 +241,75 @@ export async function extractAudio(options: {
   await run(ffmpegBin(), args, { timeoutSec: 900 });
 }
 
+export type MusicEnergyAnalysis = {
+  durationSec: number;
+  averageDb: number | null;
+  peakTimesSec: number[];
+  estimatedBpm: number | null;
+  vibe: string;
+};
+
+/** Lightweight half-second RMS analysis; no ML model or persistent process. */
+export async function analyzeMusicEnergy(filePath: string): Promise<MusicEnergyAnalysis> {
+  const durationSec = await mediaDurationSeconds(filePath);
+  const samples: Array<{ time: number; db: number }> = [];
+  let currentTime = 0;
+  let remainder = "";
+  const parseLine = (line: string) => {
+    const time = line.match(/pts_time:([\d.]+)/);
+    if (time) currentTime = Number(time[1]);
+    const rms = line.match(/lavfi\.astats\.Overall\.RMS_level=([-\d.]+)/);
+    if (rms) {
+      const db = Number(rms[1]);
+      if (Number.isFinite(db)) samples.push({ time: currentTime, db });
+    }
+  };
+  await run(
+    ffmpegBin(),
+    [
+      "-hide_banner", "-nostats", "-i", filePath,
+      "-af", "aresample=16000,asetnsamples=n=8000:p=0,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+      "-f", "null", "-",
+    ],
+    {
+      capture: true,
+      timeoutSec: Math.max(120, Math.round(durationSec * 2)),
+      onStderr(chunk) {
+        const lines = `${remainder}${chunk}`.split("\n");
+        remainder = lines.pop() ?? "";
+        for (const line of lines) parseLine(line);
+      },
+    },
+  );
+  if (remainder) parseLine(remainder);
+  const averageDb = samples.length ? samples.reduce((sum, sample) => sum + sample.db, 0) / samples.length : null;
+  const localPeaks = samples.filter((sample, index) => {
+    const previous = samples[index - 1]?.db ?? -Infinity;
+    const next = samples[index + 1]?.db ?? -Infinity;
+    return sample.db >= previous && sample.db > next && (averageDb === null || sample.db >= averageDb + 2.5);
+  });
+  const peakTimesSec: number[] = [];
+  for (const peak of localPeaks) {
+    if (!peakTimesSec.length || peak.time - peakTimesSec[peakTimesSec.length - 1] >= 0.35) {
+      peakTimesSec.push(Number(peak.time.toFixed(3)));
+    }
+  }
+  const intervals = peakTimesSec.slice(1).map((time, index) => time - peakTimesSec[index]).filter((value) => value >= 0.33 && value <= 2);
+  intervals.sort((a, b) => a - b);
+  const medianInterval = intervals.length ? intervals[Math.floor(intervals.length / 2)] : null;
+  let estimatedBpm = medianInterval ? 60 / medianInterval : null;
+  while (estimatedBpm && estimatedBpm < 60) estimatedBpm *= 2;
+  while (estimatedBpm && estimatedBpm > 180) estimatedBpm /= 2;
+  const vibe = averageDb === null ? "unknown" : averageDb > -14 ? "intense" : averageDb > -22 ? "energetic" : averageDb > -32 ? "balanced" : "calm";
+  return {
+    durationSec,
+    averageDb: averageDb === null ? null : Number(averageDb.toFixed(2)),
+    peakTimesSec: peakTimesSec.slice(0, 500),
+    estimatedBpm: estimatedBpm ? Math.round(estimatedBpm) : null,
+    vibe,
+  };
+}
+
 export async function mediaDurationSeconds(filePath: string): Promise<number> {
   const { stdout } = await run(
     ffprobeBin(),
@@ -333,41 +339,95 @@ export async function renderVerticalClip(options: {
   preset: string;
   audioBitrateK: number;
   hasAudio: boolean;
+  framingMode?: "crop" | "fit";
+  music?: { input: string; startOffsetSec: number; volume?: number };
+  soundEffects?: Array<{ input: string; atSec?: number; volume?: number }>;
   onProgress?: RenderProgress;
 }): Promise<void> {
   const duration = Math.max(0.5, options.endSec - options.startSec);
-  const crop = [
-    `crop=w='min(iw,ih*${options.targetWidth}/${options.targetHeight})':h='min(ih,iw*${options.targetHeight}/${options.targetWidth})'`,
-    `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=increase`,
-    `crop=${options.targetWidth}:${options.targetHeight}`,
-    `fps=${options.targetFps}`,
-    "setsar=1",
-  ];
+  const videoFilters = options.framingMode === "fit"
+    ? [
+        `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=decrease`,
+        `pad=${options.targetWidth}:${options.targetHeight}:(ow-iw)/2:(oh-ih)/2:color=black`,
+        `fps=${options.targetFps}`,
+        "setsar=1",
+      ]
+    : [
+        `scale=${options.targetWidth}:${options.targetHeight}:force_original_aspect_ratio=increase`,
+        `crop=${options.targetWidth}:${options.targetHeight}:(iw-ow)/2:(ih-oh)/2`,
+        `fps=${options.targetFps}`,
+        "setsar=1",
+      ];
   if (options.subtitlesEnabled && options.subtitlePath) {
-    crop.push(`ass=${quoteFilterPath(options.subtitlePath)}:fontsdir=${quoteFilterPath(fontsDir())}`);
+    videoFilters.push(`ass=${quoteFilterPath(options.subtitlePath)}:fontsdir=${quoteFilterPath(fontsDir())}`);
   }
-  const vf = crop.join(",");
 
   const args = [
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-stats",
-    "-y",
-    "-ss",
-    options.startSec.toFixed(3),
-    "-i",
-    options.input,
-    "-t",
-    duration.toFixed(3),
-    "-vf",
-    vf,
+    "-hide_banner", "-loglevel", "warning", "-stats", "-y",
+    "-ss", options.startSec.toFixed(3), "-i", options.input,
   ];
+  let nextInputIndex = 1;
+  let musicInputIndex: number | null = null;
+  if (options.music) {
+    musicInputIndex = nextInputIndex++;
+    args.push(
+      "-stream_loop", "-1",
+      "-ss", Math.max(0, options.music.startOffsetSec).toFixed(3),
+      "-i", options.music.input,
+    );
+  }
+  const effectInputs = (options.soundEffects ?? []).slice(0, 4).map((effect) => ({
+    ...effect,
+    inputIndex: nextInputIndex++,
+  }));
+  for (const effect of effectInputs) args.push("-i", effect.input);
+  args.push("-t", duration.toFixed(3));
 
-  if (options.hasAudio) {
-    args.push("-map", "0:v:0", "-map", "0:a:0?", "-c:a", "aac", "-b:a", `${options.audioBitrateK}k`, "-ar", "44100", "-ac", "2");
+  const hasAddedAudio = musicInputIndex !== null || effectInputs.length > 0;
+  if (hasAddedAudio) {
+    const audioFilters = [`[0:v]${videoFilters.join(",")}[vout]`];
+    const mixInputs: string[] = [];
+    if (options.hasAudio && musicInputIndex !== null) {
+      audioFilters.push("[0:a:0]aresample=44100,asetpts=PTS-STARTPTS,asplit=2[speechmix][speechside]");
+      mixInputs.push("[speechmix]");
+    } else if (options.hasAudio) {
+      audioFilters.push("[0:a:0]aresample=44100,asetpts=PTS-STARTPTS[speechmix]");
+      mixInputs.push("[speechmix]");
+    }
+    if (musicInputIndex !== null && options.music) {
+      const volume = Math.max(0.03, Math.min(0.5, options.music.volume ?? 0.18));
+      const fadeOutStart = Math.max(0, duration - 1);
+      audioFilters.push(
+        `[${musicInputIndex}:a]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${Math.min(0.8, duration / 3).toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${Math.min(1, duration).toFixed(3)}[music]`,
+      );
+      if (options.hasAudio) {
+        audioFilters.push("[music][speechside]sidechaincompress=threshold=0.025:ratio=8:attack=20:release=400[ducked]");
+        mixInputs.push("[ducked]");
+      } else {
+        mixInputs.push("[music]");
+      }
+    }
+    effectInputs.forEach((effect, index) => {
+      const atSec = Math.max(0, Math.min(duration - 0.05, effect.atSec ?? 0));
+      const delayMs = Math.round(atSec * 1000);
+      const volume = Math.max(0.03, Math.min(1, effect.volume ?? 0.3));
+      audioFilters.push(
+        `[${effect.inputIndex}:a]aresample=44100,atrim=duration=${Math.max(0.05, duration - atSec).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${volume.toFixed(3)},apad,atrim=duration=${duration.toFixed(3)}[sfx${index}]`,
+      );
+      mixInputs.push(`[sfx${index}]`);
+    });
+    audioFilters.push(
+      `${mixInputs.join("")}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`,
+    );
+    args.push("-filter_complex", audioFilters.join(";"), "-map", "[vout]", "-map", "[aout]");
   } else {
-    args.push("-map", "0:v:0", "-an");
+    args.push("-vf", videoFilters.join(","), "-map", "0:v:0");
+    if (options.hasAudio) args.push("-map", "0:a:0?");
+    else args.push("-an");
+  }
+
+  if (options.hasAudio || hasAddedAudio) {
+    args.push("-c:a", "aac", "-b:a", `${options.audioBitrateK}k`, "-ar", "44100", "-ac", "2");
   }
 
   args.push(
@@ -403,6 +463,41 @@ export async function renderVerticalClip(options: {
   });
 }
 
+/** Add music to an already-rendered clip without touching/re-encoding its video stream. */
+export async function mixPostRenderMusic(options: {
+  clipInput: string;
+  musicInput: string;
+  output: string;
+  durationSec: number;
+  clipHasAudio: boolean;
+  volume?: number;
+  onProgress?: (ratio: number) => void;
+}): Promise<void> {
+  const duration = Math.max(0.1, options.durationSec);
+  const volume = Math.max(0.01, Math.min(0.5, options.volume ?? 0.12));
+  const fadeIn = Math.min(0.8, duration / 3);
+  const fadeOut = Math.min(1, duration / 3);
+  const fadeOutStart = Math.max(0, duration - fadeOut);
+  const args = ["-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", options.clipInput,
+    "-stream_loop", "-1", "-i", options.musicInput, "-t", duration.toFixed(3)];
+  const music = `[1:a:0]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${fadeIn.toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeOut.toFixed(3)}[music]`;
+  const filter = options.clipHasAudio
+    ? `${music};[0:a:0]aresample=44100,asetpts=PTS-STARTPTS,apad,atrim=duration=${duration.toFixed(3)}[speech];[speech][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`
+    : `${music};[music]alimiter=limit=0.95[aout]`;
+  args.push("-filter_complex", filter, "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", options.output);
+  await run(ffmpegBin(), args, {
+    timeoutSec: Math.max(180, Math.round(duration * 6)),
+    onStderr: (chunk) => {
+      if (!options.onProgress) return;
+      for (const match of chunk.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)) {
+        const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        options.onProgress(Math.min(1, seconds / duration));
+      }
+    },
+  });
+}
+
 function quoteFilterPath(p: string): string {
   return p.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
 }
@@ -412,7 +507,6 @@ function fontsDir(): string {
     "/usr/share/fonts/truetype/dejavu",
     "/usr/share/fonts/dejavu",
     "/usr/share/fonts",
-    path.join(process.cwd(), "assets", "fonts"),
   ];
   for (const dir of candidates) {
     try {
@@ -421,7 +515,7 @@ function fontsDir(): string {
       /* ignore */
     }
   }
-  return process.cwd();
+  return "/usr/share/fonts";
 }
 
 /** Pull a still frame so the UI can show a poster for each clip. */

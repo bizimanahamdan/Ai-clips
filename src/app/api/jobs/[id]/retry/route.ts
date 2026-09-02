@@ -1,17 +1,16 @@
-import fsp from "node:fs/promises";
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { clips, jobEvents, jobs } from "@/db/schema";
+import { jobEvents, jobs } from "@/db/schema";
 import { AppError, toErrorPayload } from "@/lib/errors";
-import { createJobDir } from "@/lib/storage";
 import { ensureRuntime } from "@/lib/jobs";
 import { config } from "@/lib/config";
+import { headObject } from "@/lib/object-storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Re-run a failed or partially failed job from the beginning. */
+/** Resume a failed or partial job from its earliest incomplete checkpoint. */
 export async function POST(_request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     await ensureRuntime();
@@ -21,25 +20,36 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
     if (job.status === "queued" || job.status === "processing") {
       return NextResponse.json({ jobId: id, alreadyRunning: true });
     }
-    if (job.sourceType === "upload" && job.filePath) {
-      const stat = await fsp.stat(job.filePath).catch(() => null);
-      if (!stat) {
+    if (job.status === "cleanup_pending") {
+      throw new AppError("bad_request", "This completed job is currently being removed by retention cleanup.", { status: 409 });
+    }
+    if (!job.sourceObjectKey && job.sourceType === "upload") {
+      throw new AppError("source_object_missing", "This upload job has no persisted sourceObjectKey.", {
+        detail: `job=${id} stage=retry`,
+        status: 410,
+      });
+    }
+    // A non-null size means acquisition completed and the persisted key must
+    // exist. Do not hide durable data loss by re-uploading or redownloading.
+    if (job.sourceObjectKey && job.fileSizeBytes !== null) {
+      const source = await headObject(job.sourceObjectKey);
+      console.info(`[R2 source check] bucket=${config.r2BucketName} key=${job.sourceObjectKey} job=${id} stage=retry exists=${source.exists}`);
+      if (!source.exists) {
         throw new AppError(
-          "unsupported_media",
-          "The original upload is no longer on the server. Uploads are temporary after the retention window.",
-          { status: 410 },
+          "source_object_missing",
+          "The source no longer exists at this job's exact Cloudflare R2 key.",
+          { detail: `job=${id} stage=retry sourceObjectKey=${job.sourceObjectKey}`, status: 410 },
         );
       }
     }
+    console.info(`[retry checkpoint] job=${id} stage=${job.stage} transcript=${Boolean(job.transcript)} analysisSelection=${Boolean(job.analysisCheckpoint?.selectionComplete)} sourceObjectKey=${job.sourceObjectKey ?? "none"}`);
 
-    await createJobDir(id);
-    await db.delete(clips).where(eq(clips.jobId, id));
     await db
       .update(jobs)
       .set({
         status: "queued",
         stage: "queued",
-        stageDetail: "Queued for retry",
+        stageDetail: "Queued to resume from saved checkpoints",
         progress: 0,
         error: null,
         finishedAt: null,
@@ -51,7 +61,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
       jobId: id,
       stage: "queued",
       level: "warn",
-      message: "Retry requested — the pipeline will run again from the start.",
+      message: "Retry requested — saved source, probe, transcript, chunk analysis, selection, and completed renders will be reused.",
     });
 
     const { enqueueJob } = await import("@/lib/jobs");
@@ -61,7 +71,7 @@ export async function POST(_request: Request, context: { params: Promise<{ id: s
   } catch (error) {
     const payload = toErrorPayload(error);
     return NextResponse.json(
-      { error: payload.message, kind: payload.kind },
+      { error: payload.message, kind: payload.kind, detail: payload.detail },
       { status: error instanceof AppError ? error.status : 500 },
     );
   }

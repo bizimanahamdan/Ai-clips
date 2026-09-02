@@ -1,6 +1,7 @@
 import { config } from "./config";
 import { AppError } from "./errors";
 import type { ClipCandidate, Transcript, Word } from "./types";
+import { preferredClipMin } from "./clip-duration";
 
 export type ValidatedClip = ClipCandidate & { index: number; words: Word[] };
 
@@ -44,6 +45,40 @@ function snapToSpeech(seconds: number, words: Word[], mode: "start" | "end"): nu
   return Math.max(seconds, last.end);
 }
 
+function endAtSpeechBoundary(start: number, limit: number, words: Word[], preferredMin: number): number {
+  const candidates = words.filter((word) => word.end <= limit && word.end >= start + preferredMin);
+  if (!candidates.length) return limit;
+  const sentenceEnds = candidates.filter((word) => /[.!?][”"']?$/.test(word.word));
+  return (sentenceEnds.at(-1) ?? candidates.at(-1))?.end ?? limit;
+}
+
+/** Align timestamp fallbacks to the transcript boundaries they actually touch. */
+function alignToTranscriptSegments(
+  start: number,
+  end: number,
+  transcript: Transcript,
+  maxDuration: number,
+): { start: number; end: number } {
+  if (!transcript.segments.length) return { start, end };
+  const first = transcript.segments.find((segment) => segment.end > start);
+  let last: Transcript["segments"][number] | undefined;
+  for (let index = transcript.segments.length - 1; index >= 0; index -= 1) {
+    if (transcript.segments[index].start < end) {
+      last = transcript.segments[index];
+      break;
+    }
+  }
+  let alignedStart = first && Math.abs(first.start - start) <= 3 ? first.start : start;
+  let alignedEnd = last && Math.abs(last.end - end) <= 3 ? last.end : end;
+  if (alignedEnd - alignedStart > maxDuration) {
+    // Preserve the natural opening; the final cap is snapped to a sentence end.
+    alignedEnd = alignedStart + maxDuration;
+  }
+  alignedStart = Math.max(0, alignedStart);
+  alignedEnd = Math.min(transcript.durationSec, alignedEnd);
+  return { start: alignedStart, end: alignedEnd };
+}
+
 /** Words that overlap the clip window, with timestamps relative to clip start. */
 function wordsInWindow(words: Word[], start: number, end: number): Word[] {
   const inWindow = words.filter((w) => w.end > start + 0.05 && w.start < end - 0.05);
@@ -63,16 +98,31 @@ export function validateClips(options: {
   durationSec: number;
   transcript: Transcript;
   requestedClips: number;
+  maxClipSec: number;
   rejected?: string[];
 }): ValidatedClip[] {
   const rejected = options.rejected ?? [];
   const words = options.transcript.words;
-  const maxClipSec = Math.max(config.minClipSec + 1, Math.min(config.maxClipSec, options.durationSec));
+  const maxClipSec = Math.max(
+    Math.min(config.minClipSec, options.durationSec),
+    Math.min(config.maxClipSec, options.maxClipSec, options.durationSec),
+  );
+  const targetMinSec = preferredClipMin(maxClipSec, Math.min(config.minClipSec, maxClipSec));
   const issues: string[] = [];
 
   const seen: ValidatedClip[] = [];
+  // Longer, target-range suggestions get first claim on a transcript window.
+  // Short minimum-length suggestions remain available only as fallbacks.
+  const orderedCandidates = [...options.candidates].sort((a, b) => {
+    const aDuration = Number(a.endSec) - Number(a.startSec);
+    const bDuration = Number(b.endSec) - Number(b.startSec);
+    const aInTarget = Number.isFinite(aDuration) && aDuration >= targetMinSec ? 1 : 0;
+    const bInTarget = Number.isFinite(bDuration) && bDuration >= targetMinSec ? 1 : 0;
+    if (aInTarget !== bInTarget) return bInTarget - aInTarget;
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
 
-  for (const candidate of options.candidates) {
+  for (const candidate of orderedCandidates) {
     const rawStart = Number(candidate.startSec);
     const rawEnd = Number(candidate.endSec);
 
@@ -85,23 +135,28 @@ export function validateClips(options: {
     let end = clamp(rawEnd, 0, options.durationSec);
 
     if (end - start < 2) {
-      // Models sometimes swap or collapse ranges — try to repair before dropping.
+      // Repair an obvious swapped range, but never manufacture unrelated
+      // dialogue merely to make a collapsed AI suggestion long enough.
       if (rawStart > rawEnd && rawStart - rawEnd >= config.minClipSec) {
-        const temp = start;
         start = clamp(rawEnd, 0, options.durationSec);
         end = clamp(rawStart, 0, options.durationSec);
-        void temp;
       } else {
-        end = Math.min(options.durationSec, start + Math.min(maxClipSec, config.minClipSec + 8));
+        issues.push(`Dropped "${cleanText(candidate.title, 40, "clip")}": collapsed time range.`);
+        continue;
       }
     }
 
-    start = snapToSpeech(start, words, "start");
-    end = Math.max(start + config.minClipSec, snapToSpeech(end, words, "end"));
-
+    const selectedSegments = Number.isInteger(candidate.startSegment) && Number.isInteger(candidate.endSegment);
+    if (!selectedSegments) {
+      const aligned = alignToTranscriptSegments(start, end, options.transcript, maxClipSec);
+      start = snapToSpeech(aligned.start, words, "start");
+      end = snapToSpeech(aligned.end, words, "end");
+    }
     let duration = end - start;
+
     if (duration > maxClipSec) {
-      end = start + maxClipSec;
+      const limit = start + maxClipSec;
+      end = endAtSpeechBoundary(start, limit, words, targetMinSec);
       duration = end - start;
     }
     if (duration < Math.min(config.minClipSec, options.durationSec)) {
@@ -131,7 +186,13 @@ export function validateClips(options: {
     });
   }
 
-  seen.sort((a, b) => b.score - a.score);
+  // Complete target-range stories outrank short fallback snippets; score then
+  // decides among candidates in the same duration tier.
+  seen.sort((a, b) => {
+    const aPreferred = a.endSec - a.startSec >= targetMinSec ? 1 : 0;
+    const bPreferred = b.endSec - b.startSec >= targetMinSec ? 1 : 0;
+    return aPreferred === bPreferred ? b.score - a.score : bPreferred - aPreferred;
+  });
   const limited = seen.slice(0, Math.max(1, options.requestedClips));
   limited.forEach((clip, index) => {
     clip.index = index;
