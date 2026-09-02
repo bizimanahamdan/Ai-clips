@@ -155,6 +155,14 @@ export const clips = pgTable(
     filePath: text("file_path"),
     objectKey: text("object_key"),
     posterObjectKey: text("poster_object_key"),
+    /** Non-destructive post-render music state; originalObjectKey is never overwritten. */
+    originalObjectKey: text("original_object_key"),
+    musicAssetId: text("music_asset_id"),
+    musicObjectKey: text("music_object_key"),
+    musicVolume: real("music_volume"),
+    musicEnabled: integer("music_enabled").notNull().default(0),
+    musicStatus: text("music_status").notNull().default("none"), // none | applying | uploading | complete | failed
+    musicError: text("music_error"),
     fileName: text("file_name"),
     fileSizeBytes: integer("file_size_bytes"),
     width: integer("width"),

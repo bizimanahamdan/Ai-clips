@@ -122,7 +122,7 @@ async function restorePersistedSource(
 
   const extension = path.extname(job.sourceName) || ".mp4";
   const localPath = path.join(workDir, `source${extension}`);
-  await downloadObjectToFile(key, localPath);
+  await downloadObjectToFile(key, localPath, { kind: "source", jobId: job.id, stage: "restore_source" });
   const { size } = await fsp.stat(localPath);
   if (metadata.sizeBytes !== null && size !== metadata.sizeBytes) {
     await fsp.rm(localPath, { force: true });

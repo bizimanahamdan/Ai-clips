@@ -150,7 +150,7 @@ export async function downloadLibraryAssets(assets: LibraryAsset[], workDir: str
   for (const asset of assets) {
     const extension = path.extname(asset.fileName).toLowerCase() || ".audio";
     const localPath = path.join(directory, `${asset.id}${extension}`);
-    await downloadObjectToFile(asset.objectKey, localPath);
+    await downloadObjectToFile(asset.objectKey, localPath, { kind: "media", label: `Media Library asset ${asset.id}` });
     result.set(asset.id, localPath);
   }
   return result;

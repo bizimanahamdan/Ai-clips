@@ -39,6 +39,8 @@ export const config = {
   r2BucketName: process.env.R2_BUCKET_NAME?.trim() || "",
   r2Endpoint: process.env.R2_ENDPOINT?.trim().replace(/\/$/, "") || "",
   frontendUrl: process.env.FRONTEND_URL?.trim().replace(/\/$/, "") || "",
+  /** Optional admin-only storage explorer credential (server-only). */
+  adminPassword: process.env.ADMIN_PASSWORD || "",
   minFreeDiskMb: num("MIN_FREE_DISK_MB", 1500),
   cleanupIntervalMinutes: num("CLEANUP_INTERVAL_MINUTES", 15),
 

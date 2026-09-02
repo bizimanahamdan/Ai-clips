@@ -463,6 +463,41 @@ export async function renderVerticalClip(options: {
   });
 }
 
+/** Add music to an already-rendered clip without touching/re-encoding its video stream. */
+export async function mixPostRenderMusic(options: {
+  clipInput: string;
+  musicInput: string;
+  output: string;
+  durationSec: number;
+  clipHasAudio: boolean;
+  volume?: number;
+  onProgress?: (ratio: number) => void;
+}): Promise<void> {
+  const duration = Math.max(0.1, options.durationSec);
+  const volume = Math.max(0.01, Math.min(0.5, options.volume ?? 0.12));
+  const fadeIn = Math.min(0.8, duration / 3);
+  const fadeOut = Math.min(1, duration / 3);
+  const fadeOutStart = Math.max(0, duration - fadeOut);
+  const args = ["-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", options.clipInput,
+    "-stream_loop", "-1", "-i", options.musicInput, "-t", duration.toFixed(3)];
+  const music = `[1:a:0]aresample=44100,atrim=duration=${duration.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume.toFixed(3)},afade=t=in:st=0:d=${fadeIn.toFixed(3)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeOut.toFixed(3)}[music]`;
+  const filter = options.clipHasAudio
+    ? `${music};[0:a:0]aresample=44100,asetpts=PTS-STARTPTS,apad,atrim=duration=${duration.toFixed(3)}[speech];[speech][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]`
+    : `${music};[music]alimiter=limit=0.95[aout]`;
+  args.push("-filter_complex", filter, "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", options.output);
+  await run(ffmpegBin(), args, {
+    timeoutSec: Math.max(180, Math.round(duration * 6)),
+    onStderr: (chunk) => {
+      if (!options.onProgress) return;
+      for (const match of chunk.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)) {
+        const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        options.onProgress(Math.min(1, seconds / duration));
+      }
+    },
+  });
+}
+
 function quoteFilterPath(p: string): string {
   return p.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
 }

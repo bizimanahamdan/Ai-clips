@@ -138,7 +138,12 @@ export async function uploadFileToR2(
   await uploadBody(key, createReadStream(filePath), contentType);
 }
 
-export async function downloadObjectToFile(key: string, target: string): Promise<void> {
+export async function downloadObjectToFile(
+  key: string,
+  target: string,
+  context: { label?: string; kind?: "source" | "clip" | "media"; jobId?: string; stage?: string } = {},
+): Promise<void> {
+  const label = context.label || (context.kind === "source" ? "persisted source video" : context.kind === "clip" ? "rendered clip" : context.kind === "media" ? "media asset" : "object");
   try {
     const result = await r2().send(
       new GetObjectCommand({ Bucket: config.r2BucketName, Key: key }),
@@ -149,13 +154,13 @@ export async function downloadObjectToFile(key: string, target: string): Promise
   } catch (error) {
     await fsp.rm(target, { force: true });
     if (isMissingObjectError(error)) {
-      throw new AppError("source_object_missing", "The persisted source video does not exist in Cloudflare R2.", {
-        detail: `sourceObjectKey=${key}`,
+      throw new AppError("source_object_missing", `The exact ${label} does not exist in Cloudflare R2.`, {
+        detail: [`key=${key}`, context.jobId && `jobId=${context.jobId}`, context.stage && `stage=${context.stage}`].filter(Boolean).join("; "),
         status: 410,
       });
     }
-    throw new AppError("download_failed", "Could not restore the source video from Cloudflare R2.", {
-      detail: `sourceObjectKey=${key}; ${(error as Error).message}`,
+    throw new AppError("download_failed", `Could not download the ${label} from Cloudflare R2.`, {
+      detail: [`key=${key}`, context.jobId && `jobId=${context.jobId}`, context.stage && `stage=${context.stage}`, (error as Error).message].filter(Boolean).join("; "),
       status: 502,
     });
   }
@@ -201,6 +206,38 @@ export async function headObject(key: string): Promise<R2ObjectMetadata> {
     }
     throw error;
   }
+}
+
+export type R2ListedObject = {
+  key: string;
+  sizeBytes: number;
+  lastModified: Date | null;
+  etag: string | null;
+};
+
+export async function listObjectsPage(options: {
+  prefix?: string;
+  delimiter?: string;
+  continuationToken?: string;
+  maxKeys?: number;
+}): Promise<{ objects: R2ListedObject[]; prefixes: string[]; nextToken: string | null }> {
+  const result = await r2().send(new ListObjectsV2Command({
+    Bucket: config.r2BucketName,
+    Prefix: options.prefix || undefined,
+    Delimiter: options.delimiter,
+    ContinuationToken: options.continuationToken,
+    MaxKeys: Math.max(1, Math.min(1000, options.maxKeys ?? 100)),
+  }));
+  return {
+    objects: (result.Contents ?? []).filter((item): item is typeof item & { Key: string } => Boolean(item.Key)).map((item) => ({
+      key: item.Key,
+      sizeBytes: item.Size ?? 0,
+      lastModified: item.LastModified ?? null,
+      etag: item.ETag ?? null,
+    })),
+    prefixes: (result.CommonPrefixes ?? []).flatMap((item) => item.Prefix ? [item.Prefix] : []),
+    nextToken: result.IsTruncated ? result.NextContinuationToken ?? null : null,
+  };
 }
 
 export async function objectExists(key: string): Promise<boolean> {

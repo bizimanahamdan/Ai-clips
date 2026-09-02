@@ -76,6 +76,7 @@ export default function HomePage() {
   const [history, setHistory] = useState<ApiJob[]>([]);
   const [selfTest, setSelfTest] = useState<string | null>(null);
   const [selfTestRunning, setSelfTestRunning] = useState(false);
+  const [applyAllRunning, setApplyAllRunning] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const limits = appConfig?.limits;
@@ -145,6 +146,30 @@ export default function HomePage() {
       /* keep polling; transient network errors are not fatal */
     }
   }, [loadConfig, loadHistory]);
+
+  const applyMusicToAll = useCallback(async () => {
+    const job = activeJob;
+    const assetId = selectedMusicIds[0] || libraryAssets.find((asset) => asset.category === "music")?.id;
+    if (!job || !assetId) return;
+    setApplyAllRunning(true);
+    setError(null);
+    try {
+      for (const clip of job.clips.filter((item) => item.status === "ready")) {
+        const response = await fetch(`/api/clips/${clip.id}/music`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assetId, volume: 0.12 }),
+        });
+        const result = await response.json() as { error?: string };
+        if (!response.ok) throw new Error(`Clip ${clip.clipIndex + 1}: ${result.error || "music failed"}`);
+        await poll(job.id);
+      }
+    } catch (err) {
+      setError({ message: (err as Error).message });
+    } finally {
+      setApplyAllRunning(false);
+      await poll(job.id);
+    }
+  }, [activeJob, selectedMusicIds, libraryAssets, poll]);
 
   useEffect(() => {
     const jobId = activeJob?.id;
@@ -300,7 +325,7 @@ export default function HomePage() {
           <div>
             <h1 className="text-xl font-bold tracking-tight text-white">ClipForge</h1>
             <p className="text-xs text-slate-400">Long video → reusable-media-powered clips</p>
-            <Link href="/media-library" className="mt-1 inline-block text-[10px] font-medium text-indigo-300">🎵 Media Library →</Link>
+            <div className="mt-1 flex gap-3"><Link href="/media-library" className="text-[10px] font-medium text-indigo-300">🎵 Media Library →</Link><Link href="/admin/storage" className="text-[10px] font-medium text-slate-400">Admin storage →</Link></div>
           </div>
           <div className="flex flex-col items-end gap-1">
             <span
@@ -543,12 +568,18 @@ export default function HomePage() {
 
           {activeJob.clips.length ? (
             <div className="space-y-4">
-              <h2 className="text-sm font-semibold text-white">
-                Clips ({activeJob.clips.filter((clip) => clip.status === "ready").length}/
-                {activeJob.clips.length})
-              </h2>
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold text-white">
+                  Clips ({activeJob.clips.filter((clip) => clip.status === "ready").length}/{activeJob.clips.length})
+                </h2>
+                {libraryAssets.some((asset) => asset.category === "music") ? (
+                  <button type="button" disabled={applyAllRunning} onClick={() => void applyMusicToAll()} className="rounded-lg border border-indigo-400/30 bg-indigo-500/10 px-3 py-2 text-[11px] font-semibold text-indigo-200 disabled:opacity-50">
+                    {applyAllRunning ? "Applying individually…" : "Apply music to all"}
+                  </button>
+                ) : null}
+              </div>
               {activeJob.clips.map((clip) => (
-                <ClipCard key={clip.id} clip={clip} />
+                <ClipCard key={clip.id} clip={clip} musicAssets={libraryAssets.filter((asset) => asset.category === "music")} onChanged={() => poll(activeJob.id)} />
               ))}
             </div>
           ) : null}

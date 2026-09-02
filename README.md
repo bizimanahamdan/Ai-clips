@@ -95,6 +95,7 @@ Required on the Render web service (all are server-only; never prefix them with 
 | `R2_SECRET_ACCESS_KEY` | R2 token secret |
 | `R2_BUCKET_NAME` | `my-clips-storage` |
 | `R2_ENDPOINT` | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
+| `ADMIN_PASSWORD` | Strong password (12+ characters) for the server-only live R2 explorer |
 | `FRONTEND_URL` | Public Render application origin, no trailing slash |
 
 Recommended production settings:
@@ -172,6 +173,13 @@ New authorized source adapters can be added to `src/lib/video-source.ts` without
 ## Output formats and optional music
 
 Output format is selected before job creation and persisted on the job. Vertical and square outputs use aspect-preserving center crop; landscape uses aspect-preserving fit and padding, so video is never stretched. Dimensions are configurable with `TARGET_WIDTH`, `TARGET_HEIGHT`, `OUTPUT_SQUARE_SIZE`, `OUTPUT_LANDSCAPE_WIDTH`, and `OUTPUT_LANDSCAPE_HEIGHT`.
+
+## Post-render music and live R2 administration
+
+- Every ready clip can add, change, or remove a Media Library music track without rerunning ingestion, transcription, AI analysis, selection, or the original render.
+- Mixing downloads the exact retained rendered clip and exact audio asset to `/tmp/clipforge`, validates both with FFprobe, loops/trims/fades the track, copies the video stream, uploads a unique MP4 key, and only then switches the database reference. Removal restores the retained no-music object.
+- **Apply music to all** processes each existing ready clip individually at the default 12% level.
+- `/admin/storage` is a live R2 inventory and exact-key database reconciliation view. Set `ADMIN_PASSWORD` (12+ characters) to enable its HttpOnly-cookie login. Orphans are diagnostic only; deletion is always confirmed, with stronger confirmation for referenced objects.
 
 ## Persistent Media Library
 

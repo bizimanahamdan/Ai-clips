@@ -135,6 +135,11 @@ export type ApiClip = {
   width: number | null;
   height: number | null;
   error: string | null;
+  musicAssetId: string | null;
+  musicVolume: number | null;
+  musicEnabled: boolean;
+  musicStatus: string;
+  musicError: string | null;
   playbackUrl: string | null;
   downloadUrl: string | null;
 };

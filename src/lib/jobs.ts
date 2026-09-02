@@ -405,8 +405,13 @@ function mapClip(row: typeof clips.$inferSelect) {
     width: row.width,
     height: row.height,
     error: row.error,
-    playbackUrl: row.status === "ready" ? `/api/clips/${row.id}/file` : null,
-    downloadUrl: row.status === "ready" ? `/api/clips/${row.id}/file?download=1` : null,
+    musicAssetId: row.musicAssetId,
+    musicVolume: row.musicVolume,
+    musicEnabled: row.musicEnabled === 1,
+    musicStatus: row.musicStatus,
+    musicError: row.musicError,
+    playbackUrl: row.status === "ready" ? `/api/clips/${row.id}/file?v=${encodeURIComponent(row.objectKey?.split("/").pop() ?? "none")}` : null,
+    downloadUrl: row.status === "ready" ? `/api/clips/${row.id}/file?download=1&v=${encodeURIComponent(row.objectKey?.split("/").pop() ?? "none")}` : null,
   };
 }
 
